@@ -1,0 +1,4 @@
+# 忽略根目录下的某个文件夹
+/data/
+/checkpoints/
+/outputs/
