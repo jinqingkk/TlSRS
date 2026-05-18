@@ -349,3 +349,49 @@ def test_cas_mvsnet_loss_includes_depth_normal_metrics():
     assert extra["depth_normal_loss"].item() < 1e-5
     assert extra["normal_depth_cos"].item() > 0.999
     assert extra["smooth_mask_ratio"].item() > 0.999
+
+
+def test_cas_mvsnet_loss_skips_depth_normal_without_stage3_projection():
+    depth = torch.ones(1, 4, 5)
+    intrinsics = torch.eye(3).view(1, 1, 3, 3)
+    normal = compute_normal_from_depth(depth, intrinsics[:, 0])
+    inputs = {
+        "stage1": {"depth": torch.ones(1, 1, 2) * 1.0},
+        "stage2": {"depth": torch.ones(1, 2, 3) * 1.0},
+        "stage3": {
+            "depth": depth,
+            "photometric_confidence": torch.ones(1, 4, 5),
+            "normal": normal,
+        },
+        "depth": depth,
+        "photometric_confidence": torch.ones(1, 4, 5),
+        "normal": normal,
+    }
+    depth_gt_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+    mask_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+    imgs = torch.zeros(1, 1, 3, 4, 5)
+
+    total_loss, depth_loss, extra = cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        proj_matrices={},
+        dlossw=[0.5, 1.0, 2.0],
+        depth_normal_loss_weight=0.03,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+        return_extra=True,
+    )
+
+    assert total_loss.item() < 1e-5
+    assert depth_loss.item() < 1e-5
+    assert "depth_normal_loss" not in extra
