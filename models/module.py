@@ -542,13 +542,23 @@ def get_depth_normals(depth):
 def compute_normal_from_depth(depth, intrinsics):
     if depth.dim() == 4:
         depth = depth.squeeze(1)
+    batch, height, width = depth.shape
     fx = intrinsics[:, 0, 0].view(-1, 1, 1).clamp(min=1e-6)
     fy = intrinsics[:, 1, 1].view(-1, 1, 1).clamp(min=1e-6)
-    dzdx = gradient_x(depth)
-    dzdy = gradient_y(depth)
-    dzdx = torch.cat((dzdx, dzdx[:, :, -1:]), dim=2) * fx
-    dzdy = torch.cat((dzdy, dzdy[:, -1:, :]), dim=1) * fy
-    normal = torch.stack((-dzdx, -dzdy, torch.ones_like(depth)), dim=1)
+    cx = intrinsics[:, 0, 2].view(-1, 1, 1)
+    cy = intrinsics[:, 1, 2].view(-1, 1, 1)
+    x = torch.arange(width, dtype=depth.dtype, device=depth.device).view(1, 1, width)
+    y = torch.arange(height, dtype=depth.dtype, device=depth.device).view(1, height, 1)
+    x = x.expand(batch, height, width)
+    y = y.expand(batch, height, width)
+    points = torch.stack(((x - cx) / fx * depth,
+                          (y - cy) / fy * depth,
+                          depth), dim=1)
+    tangent_x = gradient_x(points)
+    tangent_y = gradient_y(points)
+    tangent_x = torch.cat((tangent_x, tangent_x[:, :, :, -1:]), dim=3)
+    tangent_y = torch.cat((tangent_y, tangent_y[:, :, -1:, :]), dim=2)
+    normal = torch.cross(tangent_x, tangent_y, dim=1)
     return F.normalize(normal, p=2, dim=1, eps=1e-6)
 
 
@@ -566,9 +576,14 @@ def image_gradient_magnitude(ref_img, target_size):
 
 def build_smooth_mask(ref_img, valid_mask, confidence, depth_normal_conf_threshold,
                       edge_grad_threshold, target_size):
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
     if valid_mask.shape[-2:] != target_size:
         valid_mask = F.interpolate(valid_mask.float().unsqueeze(1), size=target_size,
-                                   mode='nearest').squeeze(1) > 0.5
+                                   mode='nearest').squeeze(1)
+    valid_mask = valid_mask > 0.5
+    if confidence.dim() == 4:
+        confidence = confidence.squeeze(1)
     if confidence.shape[-2:] != target_size:
         confidence = F.interpolate(confidence.unsqueeze(1), size=target_size,
                                    mode='bilinear', align_corners=False).squeeze(1)
@@ -579,6 +594,8 @@ def build_smooth_mask(ref_img, valid_mask, confidence, depth_normal_conf_thresho
 
 
 def non_edge_depth_grad_mean(depth, smooth_mask):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
     depth_dx = gradient_x(depth).abs()
     depth_dy = gradient_y(depth).abs()
     mask_x = smooth_mask[:, :, 1:] & smooth_mask[:, :, :-1]
@@ -602,7 +619,7 @@ def depth_normal_consistency_loss(normal_pred, depth_pred, intrinsics, ref_img, 
     metrics = {
         "normal_depth_cos": masked_mean(cos, smooth_mask).detach(),
         "smooth_mask_ratio": smooth_mask.float().mean().detach(),
-        "non_edge_depth_grad_mean": non_edge_depth_grad_mean(depth_pred, smooth_mask).detach(),
+        "non_edge_depth_grad_mean": non_edge_depth_grad_mean(depth_pred.detach(), smooth_mask).detach(),
     }
     return loss, metrics, smooth_mask
 

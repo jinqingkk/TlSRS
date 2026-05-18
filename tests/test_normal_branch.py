@@ -4,6 +4,7 @@ from models.module import (
     NormalHead,
     compute_normal_from_depth,
     build_smooth_mask,
+    non_edge_depth_grad_mean,
     depth_normal_consistency_loss,
 )
 
@@ -32,6 +33,40 @@ def test_compute_normal_from_depth_flat_plane_points_forward():
     assert torch.allclose(normal, expected, atol=1e-5)
 
 
+def test_compute_normal_from_depth_uses_camera_space_intrinsics_for_plane_batch():
+    batch_size, height, width = 2, 4, 5
+    x = torch.arange(width).float().view(1, width).expand(height, width)
+    y = torch.arange(height).float().view(height, 1).expand(height, width)
+    intrinsics = torch.eye(3).unsqueeze(0).repeat(batch_size, 1, 1)
+    intrinsics[:, 0, 0] = torch.tensor([2.0, 4.0])
+    intrinsics[:, 1, 1] = torch.tensor([3.0, 5.0])
+    intrinsics[:, 0, 2] = torch.tensor([1.0, 2.0])
+    intrinsics[:, 1, 2] = torch.tensor([1.5, 0.5])
+    depth = torch.empty(batch_size, 1, height, width)
+
+    expected = []
+    for batch_idx in range(batch_size):
+        fx = intrinsics[batch_idx, 0, 0]
+        fy = intrinsics[batch_idx, 1, 1]
+        cx = intrinsics[batch_idx, 0, 2]
+        cy = intrinsics[batch_idx, 1, 2]
+        a = torch.tensor(0.2 + 0.1 * batch_idx)
+        b = torch.tensor(-0.15 + 0.05 * batch_idx)
+        c = torch.tensor(1.5 + 0.2 * batch_idx)
+        direction_x = (x - cx) / fx
+        direction_y = (y - cy) / fy
+        z = c / (1.0 - a * direction_x - b * direction_y)
+        depth[batch_idx, 0] = z
+        expected_normal = torch.tensor([-a, -b, 1.0])
+        expected.append(expected_normal / torch.norm(expected_normal, p=2))
+    expected = torch.stack(expected).view(batch_size, 3, 1, 1).expand(batch_size, 3, height, width)
+
+    normal = compute_normal_from_depth(depth, intrinsics)
+
+    assert normal.shape == (batch_size, 3, height, width)
+    assert torch.allclose(normal, expected, atol=1e-4)
+
+
 def test_build_smooth_mask_removes_edges_and_low_confidence():
     ref_img = torch.zeros(1, 3, 4, 6)
     ref_img[:, :, :, 3:] = 1.0
@@ -54,6 +89,43 @@ def test_build_smooth_mask_removes_edges_and_low_confidence():
     assert not smooth_mask[:, :, 3].any()
     assert smooth_mask[:, :, 1].all()
     assert smooth_mask[:, :, 4:].all()
+
+
+def test_build_smooth_mask_accepts_float_mask_and_4d_confidence_at_target_size():
+    ref_img = torch.zeros(2, 3, 3, 4)
+    valid_mask = torch.ones(2, 3, 4)
+    valid_mask[0, 0, 0] = 0.0
+    valid_mask[1, 2, 3] = 0.0
+    confidence = torch.ones(2, 1, 3, 4)
+    confidence[0, 0, 1, 1] = 0.2
+    confidence[1, 0, 1, 2] = 0.2
+
+    smooth_mask = build_smooth_mask(
+        ref_img,
+        valid_mask,
+        confidence,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+        target_size=(3, 4),
+    )
+
+    assert smooth_mask.dtype == torch.bool
+    assert smooth_mask.shape == (2, 3, 4)
+    assert not smooth_mask[0, 0, 0]
+    assert not smooth_mask[1, 2, 3]
+    assert not smooth_mask[0, 1, 1]
+    assert not smooth_mask[1, 1, 2]
+    assert smooth_mask[0, 2, 2]
+    assert smooth_mask[1, 0, 0]
+
+
+def test_non_edge_depth_grad_mean_accepts_4d_depth():
+    depth = torch.ones(2, 1, 3, 4)
+    smooth_mask = torch.ones(2, 3, 4, dtype=torch.bool)
+
+    value = non_edge_depth_grad_mean(depth, smooth_mask)
+
+    assert value.item() < 1e-6
 
 
 def test_depth_normal_consistency_loss_returns_metrics():
@@ -80,3 +152,28 @@ def test_depth_normal_consistency_loss_returns_metrics():
     assert metrics["smooth_mask_ratio"].item() > 0.999
     assert metrics["non_edge_depth_grad_mean"].item() < 1e-5
     assert smooth_mask.shape == (1, 4, 5)
+
+
+def test_depth_normal_consistency_loss_accepts_4d_depth_confidence_and_batch():
+    depth = torch.ones(2, 1, 4, 5, requires_grad=True)
+    intrinsics = torch.eye(3).unsqueeze(0).repeat(2, 1, 1)
+    normal = compute_normal_from_depth(depth, intrinsics)
+    ref_img = torch.zeros(2, 3, 4, 5)
+    mask = torch.ones(2, 4, 5)
+    confidence = torch.ones(2, 1, 4, 5)
+
+    loss, metrics, smooth_mask = depth_normal_consistency_loss(
+        normal,
+        depth,
+        intrinsics,
+        ref_img,
+        mask,
+        confidence,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+    )
+
+    assert loss.item() < 1e-5
+    assert smooth_mask.shape == (2, 4, 5)
+    assert metrics["normal_depth_cos"].item() > 0.999
+    assert not metrics["non_edge_depth_grad_mean"].requires_grad
