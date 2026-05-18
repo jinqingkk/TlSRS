@@ -123,9 +123,10 @@ class CascadeMVSNet(nn.Module):
         for stage_idx in range(self.num_stage):
             # print("*********************stage{}*********************".format(stage_idx + 1))
             #stage feature, proj_mats, scales
-            features_stage = [feat["stage{}".format(stage_idx + 1)] for feat in features]
-            proj_matrices_stage = proj_matrices["stage{}".format(stage_idx + 1)]
-            stage_scale = self.stage_infos["stage{}".format(stage_idx + 1)]["scale"]
+            stage_key = "stage{}".format(stage_idx + 1)
+            features_stage = [feat[stage_key] for feat in features]
+            proj_matrices_stage = proj_matrices[stage_key]
+            stage_scale = self.stage_infos[stage_key]["scale"]
 
             if depth is not None:
                 if self.grad_method == "detach":
@@ -154,7 +155,7 @@ class CascadeMVSNet(nn.Module):
                                           cost_regularization=self.cost_regularization if self.share_cr else self.cost_regularization[stage_idx])
 
             depth = outputs_stage['depth']
-            if stage_idx == self.num_stage - 1:
+            if stage_key == "stage3":
                 final_ref_feature = features_stage[0]
                 depth_input = depth.unsqueeze(1)
                 confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
@@ -169,7 +170,7 @@ class CascadeMVSNet(nn.Module):
                 normal_input = torch.cat([final_ref_feature, depth_input, confidence_input], dim=1)
                 outputs_stage["normal"] = self.normal_head(normal_input)
 
-            outputs["stage{}".format(stage_idx + 1)] = outputs_stage
+            outputs[stage_key] = outputs_stage
             outputs.update(outputs_stage)
 
         # depth map refinement

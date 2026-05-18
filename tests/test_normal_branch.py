@@ -279,3 +279,21 @@ def test_cascade_outputs_stage3_normal_branch():
     assert outputs["normal"].shape == (1, 3, 32, 32)
     norm = torch.norm(outputs["normal"], p=2, dim=1)
     assert torch.allclose(norm, torch.ones_like(norm), atol=1e-4)
+
+
+def test_cascade_two_stage_model_does_not_output_normal_branch():
+    torch.manual_seed(3)
+    model = CascadeMVSNet(ndepths=[8, 8], depth_interals_ratio=[4, 2])
+    model.eval()
+    imgs = torch.rand(1, 3, 3, 32, 32)
+    depth_values = torch.linspace(1.0, 2.0, 8).view(1, 8)
+    proj_matrices = {
+        "stage1": _identity_proj(1, 3),
+        "stage2": _identity_proj(1, 3),
+    }
+
+    with torch.no_grad():
+        outputs = model(imgs, proj_matrices, depth_values)
+
+    assert "normal" not in outputs
+    assert "normal" not in outputs["stage2"]
