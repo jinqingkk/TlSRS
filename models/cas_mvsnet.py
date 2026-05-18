@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .module1 import *
+from .module import *
 
 Align_Corners_Range = False
 
@@ -105,6 +105,7 @@ class CascadeMVSNet(nn.Module):
         if self.refine:
             self.refine_network = RefineNet()
         self.DepthNet = DepthNet()
+        self.normal_head = NormalHead(self.feature.out_channels[-1] + 2)
 
     def forward(self, imgs, proj_matrices, depth_values):
         depth_min = float(depth_values[0, 0].cpu().numpy())
@@ -153,6 +154,20 @@ class CascadeMVSNet(nn.Module):
                                           cost_regularization=self.cost_regularization if self.share_cr else self.cost_regularization[stage_idx])
 
             depth = outputs_stage['depth']
+            if stage_idx == self.num_stage - 1:
+                final_ref_feature = features_stage[0]
+                depth_input = depth.unsqueeze(1)
+                confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
+                if depth_input.shape[-2:] != final_ref_feature.shape[-2:]:
+                    depth_input = F.interpolate(depth_input, size=final_ref_feature.shape[-2:],
+                                                mode='bilinear',
+                                                align_corners=Align_Corners_Range)
+                if confidence_input.shape[-2:] != final_ref_feature.shape[-2:]:
+                    confidence_input = F.interpolate(confidence_input, size=final_ref_feature.shape[-2:],
+                                                     mode='bilinear',
+                                                     align_corners=Align_Corners_Range)
+                normal_input = torch.cat([final_ref_feature, depth_input, confidence_input], dim=1)
+                outputs_stage["normal"] = self.normal_head(normal_input)
 
             outputs["stage{}".format(stage_idx + 1)] = outputs_stage
             outputs.update(outputs_stage)

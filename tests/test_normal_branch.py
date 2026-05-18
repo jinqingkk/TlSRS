@@ -249,3 +249,33 @@ def test_depth_normal_consistency_loss_backpropagates_to_normals_and_depth():
     assert depth.grad is not None
     assert normal.grad.abs().sum().item() > 0.0
     assert depth.grad.abs().sum().item() > 0.0
+
+
+from models.cas_mvsnet import CascadeMVSNet
+
+
+def _identity_proj(batch, views):
+    proj = torch.eye(4).view(1, 1, 1, 4, 4).repeat(batch, views, 2, 1, 1)
+    return proj
+
+
+def test_cascade_outputs_stage3_normal_branch():
+    torch.manual_seed(2)
+    model = CascadeMVSNet(ndepths=[8, 8, 8], depth_interals_ratio=[4, 2, 1])
+    model.eval()
+    imgs = torch.rand(1, 3, 3, 32, 32)
+    depth_values = torch.linspace(1.0, 2.0, 8).view(1, 8)
+    proj_matrices = {
+        "stage1": _identity_proj(1, 3),
+        "stage2": _identity_proj(1, 3),
+        "stage3": _identity_proj(1, 3),
+    }
+
+    with torch.no_grad():
+        outputs = model(imgs, proj_matrices, depth_values)
+
+    assert "normal" in outputs
+    assert "normal" in outputs["stage3"]
+    assert outputs["normal"].shape == (1, 3, 32, 32)
+    norm = torch.norm(outputs["normal"], p=2, dim=1)
+    assert torch.allclose(norm, torch.ones_like(norm), atol=1e-4)
