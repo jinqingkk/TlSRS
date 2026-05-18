@@ -499,6 +499,20 @@ class RefineNet(nn.Module):
         return depth_refined
 
 
+class NormalHead(nn.Module):
+    def __init__(self, in_channels, hidden_channels=32):
+        super(NormalHead, self).__init__()
+        self.conv1 = Conv2d(in_channels, hidden_channels, 3, 1, padding=1)
+        self.conv2 = Conv2d(hidden_channels, hidden_channels, 3, 1, padding=1)
+        self.conv3 = nn.Conv2d(hidden_channels, 3, 3, stride=1, padding=1, bias=True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        return F.normalize(x, p=2, dim=1, eps=1e-6)
+
+
 def depth_regression(p, depth_values):
     if depth_values.dim() <= 2:
         # print("regression dim <= 2")
@@ -523,6 +537,74 @@ def get_depth_normals(depth):
     dzdy = torch.cat((dzdy, dzdy[:, -1:, :]), dim=1)
     normal = torch.stack((-dzdx, -dzdy, torch.ones_like(depth)), dim=1)
     return F.normalize(normal, p=2, dim=1, eps=1e-6)
+
+
+def compute_normal_from_depth(depth, intrinsics):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    fx = intrinsics[:, 0, 0].view(-1, 1, 1).clamp(min=1e-6)
+    fy = intrinsics[:, 1, 1].view(-1, 1, 1).clamp(min=1e-6)
+    dzdx = gradient_x(depth)
+    dzdy = gradient_y(depth)
+    dzdx = torch.cat((dzdx, dzdx[:, :, -1:]), dim=2) * fx
+    dzdy = torch.cat((dzdy, dzdy[:, -1:, :]), dim=1) * fy
+    normal = torch.stack((-dzdx, -dzdy, torch.ones_like(depth)), dim=1)
+    return F.normalize(normal, p=2, dim=1, eps=1e-6)
+
+
+def image_gradient_magnitude(ref_img, target_size):
+    ref_img = F.interpolate(ref_img, size=target_size, mode='bilinear', align_corners=False)
+    img_dx = gradient_x(ref_img).abs().mean(dim=1)
+    img_dy = gradient_y(ref_img).abs().mean(dim=1)
+    grad = ref_img.new_zeros(ref_img.size(0), target_size[0], target_size[1])
+    grad[:, :, 1:] = torch.max(grad[:, :, 1:], img_dx)
+    grad[:, :, :-1] = torch.max(grad[:, :, :-1], img_dx)
+    grad[:, 1:, :] = torch.max(grad[:, 1:, :], img_dy)
+    grad[:, :-1, :] = torch.max(grad[:, :-1, :], img_dy)
+    return grad
+
+
+def build_smooth_mask(ref_img, valid_mask, confidence, depth_normal_conf_threshold,
+                      edge_grad_threshold, target_size):
+    if valid_mask.shape[-2:] != target_size:
+        valid_mask = F.interpolate(valid_mask.float().unsqueeze(1), size=target_size,
+                                   mode='nearest').squeeze(1) > 0.5
+    if confidence.shape[-2:] != target_size:
+        confidence = F.interpolate(confidence.unsqueeze(1), size=target_size,
+                                   mode='bilinear', align_corners=False).squeeze(1)
+    high_confidence_mask = confidence > depth_normal_conf_threshold
+    edge_grad = image_gradient_magnitude(ref_img, target_size)
+    non_edge_mask = edge_grad < edge_grad_threshold
+    return valid_mask & high_confidence_mask & non_edge_mask
+
+
+def non_edge_depth_grad_mean(depth, smooth_mask):
+    depth_dx = gradient_x(depth).abs()
+    depth_dy = gradient_y(depth).abs()
+    mask_x = smooth_mask[:, :, 1:] & smooth_mask[:, :, :-1]
+    mask_y = smooth_mask[:, 1:, :] & smooth_mask[:, :-1, :]
+    return 0.5 * (masked_mean(depth_dx, mask_x) + masked_mean(depth_dy, mask_y))
+
+
+def depth_normal_consistency_loss(normal_pred, depth_pred, intrinsics, ref_img, valid_mask,
+                                  confidence, depth_normal_conf_threshold=0.8,
+                                  edge_grad_threshold=0.05):
+    target_size = depth_pred.shape[-2:]
+    if normal_pred.shape[-2:] != target_size:
+        normal_pred = F.interpolate(normal_pred, size=target_size, mode='bilinear', align_corners=False)
+        normal_pred = F.normalize(normal_pred, p=2, dim=1, eps=1e-6)
+    smooth_mask = build_smooth_mask(ref_img, valid_mask, confidence,
+                                    depth_normal_conf_threshold,
+                                    edge_grad_threshold, target_size)
+    normal_depth = compute_normal_from_depth(depth_pred, intrinsics)
+    cos = torch.abs((normal_pred * normal_depth.detach()).sum(dim=1)).clamp(0.0, 1.0)
+    loss = masked_mean(1.0 - cos, smooth_mask)
+    metrics = {
+        "normal_depth_cos": masked_mean(cos, smooth_mask).detach(),
+        "smooth_mask_ratio": smooth_mask.float().mean().detach(),
+        "non_edge_depth_grad_mean": non_edge_depth_grad_mean(depth_pred, smooth_mask).detach(),
+    }
+    return loss, metrics, smooth_mask
 
 
 def masked_mean(value, mask):
