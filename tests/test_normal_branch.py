@@ -9,6 +9,7 @@ from models.module import (
     depth_normal_consistency_loss,
     cas_mvsnet_loss,
 )
+from models.cas_mvsnet import CascadeMVSNet
 
 
 def test_normal_head_outputs_unit_normals():
@@ -299,6 +300,17 @@ def test_cascade_two_stage_model_does_not_output_normal_branch():
 
     assert "normal" not in outputs
     assert "normal" not in outputs["stage2"]
+
+
+def test_cascade_model_loads_depth_only_checkpoint_with_missing_normal_head():
+    model = CascadeMVSNet(ndepths=[8, 8, 8], depth_interals_ratio=[4, 2, 1])
+    state = model.state_dict()
+    depth_only_state = {k: v for k, v in state.items() if not k.startswith("normal_head")}
+
+    missing_keys, unexpected_keys = model.load_state_dict(depth_only_state, strict=False)
+
+    assert unexpected_keys == []
+    assert any(k.startswith("normal_head") for k in missing_keys)
 
 
 def test_cas_mvsnet_loss_includes_depth_normal_metrics():
