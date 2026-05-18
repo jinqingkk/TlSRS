@@ -603,6 +603,17 @@ def non_edge_depth_grad_mean(depth, smooth_mask):
     return 0.5 * (masked_mean(depth_dx, mask_x) + masked_mean(depth_dy, mask_y))
 
 
+def scale_intrinsics(intrinsics, source_size, target_size):
+    if source_size == target_size:
+        return intrinsics
+    scaled = intrinsics.clone()
+    scale_y = float(target_size[0]) / float(source_size[0])
+    scale_x = float(target_size[1]) / float(source_size[1])
+    scaled[:, 0, :] *= scale_x
+    scaled[:, 1, :] *= scale_y
+    return scaled
+
+
 def depth_normal_consistency_loss(normal_pred, depth_pred, intrinsics, ref_img, valid_mask,
                                   confidence, depth_normal_conf_threshold=0.8,
                                   edge_grad_threshold=0.05):
@@ -613,6 +624,7 @@ def depth_normal_consistency_loss(normal_pred, depth_pred, intrinsics, ref_img, 
     smooth_mask = build_smooth_mask(ref_img, valid_mask, confidence,
                                     depth_normal_conf_threshold,
                                     edge_grad_threshold, target_size)
+    intrinsics = scale_intrinsics(intrinsics, ref_img.shape[-2:], target_size)
     normal_depth = compute_normal_from_depth(depth_pred, intrinsics)
     cos = torch.abs((normal_pred * normal_depth.detach()).sum(dim=1)).clamp(0.0, 1.0)
     loss = masked_mean(1.0 - cos, smooth_mask)

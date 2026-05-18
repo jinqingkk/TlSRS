@@ -177,3 +177,45 @@ def test_depth_normal_consistency_loss_accepts_4d_depth_confidence_and_batch():
     assert smooth_mask.shape == (2, 4, 5)
     assert metrics["normal_depth_cos"].item() > 0.999
     assert not metrics["non_edge_depth_grad_mean"].requires_grad
+
+
+def test_depth_normal_consistency_loss_scales_intrinsics_for_lower_resolution_depth():
+    source_size = (8, 10)
+    target_size = (4, 5)
+    full_intrinsics = torch.eye(3).unsqueeze(0)
+    full_intrinsics[:, 0, 0] = 8.0
+    full_intrinsics[:, 1, 1] = 10.0
+    full_intrinsics[:, 0, 2] = 4.0
+    full_intrinsics[:, 1, 2] = 3.0
+    scaled_intrinsics = full_intrinsics.clone()
+    scaled_intrinsics[:, 0, :] *= float(target_size[1]) / float(source_size[1])
+    scaled_intrinsics[:, 1, :] *= float(target_size[0]) / float(source_size[0])
+    x = torch.arange(target_size[1]).float().view(1, target_size[1]).expand(target_size)
+    y = torch.arange(target_size[0]).float().view(target_size[0], 1).expand(target_size)
+    a = torch.tensor(0.25)
+    b = torch.tensor(-0.1)
+    c = torch.tensor(1.7)
+    direction_x = (x - scaled_intrinsics[0, 0, 2]) / scaled_intrinsics[0, 0, 0]
+    direction_y = (y - scaled_intrinsics[0, 1, 2]) / scaled_intrinsics[0, 1, 1]
+    depth = (c / (1.0 - a * direction_x - b * direction_y)).unsqueeze(0)
+    expected_normal = torch.tensor([-a, -b, 1.0])
+    expected_normal = expected_normal / torch.norm(expected_normal, p=2)
+    normal = expected_normal.view(1, 3, 1, 1).expand(1, 3, target_size[0], target_size[1])
+    ref_img = torch.zeros(1, 3, source_size[0], source_size[1])
+    mask = torch.ones(1, target_size[0], target_size[1], dtype=torch.bool)
+    confidence = torch.ones(1, target_size[0], target_size[1])
+
+    loss, metrics, smooth_mask = depth_normal_consistency_loss(
+        normal,
+        depth,
+        full_intrinsics,
+        ref_img,
+        mask,
+        confidence,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+    )
+
+    assert smooth_mask.shape == (1, target_size[0], target_size[1])
+    assert loss.item() < 1e-5
+    assert metrics["normal_depth_cos"].item() > 0.999
