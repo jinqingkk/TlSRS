@@ -219,3 +219,33 @@ def test_depth_normal_consistency_loss_scales_intrinsics_for_lower_resolution_de
     assert smooth_mask.shape == (1, target_size[0], target_size[1])
     assert loss.item() < 1e-5
     assert metrics["normal_depth_cos"].item() > 0.999
+
+
+def test_depth_normal_consistency_loss_backpropagates_to_normals_and_depth():
+    torch.manual_seed(4)
+    depth = 1.0 + torch.rand(1, 4, 5)
+    depth.requires_grad_()
+    normal = torch.zeros(1, 3, 4, 5)
+    normal[:, 2] = 1.0
+    normal.requires_grad_()
+    intrinsics = torch.eye(3).unsqueeze(0)
+    ref_img = torch.zeros(1, 3, 4, 5)
+    mask = torch.ones(1, 4, 5, dtype=torch.bool)
+    confidence = torch.ones(1, 4, 5)
+
+    loss, _, _ = depth_normal_consistency_loss(
+        normal,
+        depth,
+        intrinsics,
+        ref_img,
+        mask,
+        confidence,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+    )
+    loss.backward()
+
+    assert normal.grad is not None
+    assert depth.grad is not None
+    assert normal.grad.abs().sum().item() > 0.0
+    assert depth.grad.abs().sum().item() > 0.0

@@ -626,7 +626,7 @@ def depth_normal_consistency_loss(normal_pred, depth_pred, intrinsics, ref_img, 
                                     edge_grad_threshold, target_size)
     intrinsics = scale_intrinsics(intrinsics, ref_img.shape[-2:], target_size)
     normal_depth = compute_normal_from_depth(depth_pred, intrinsics)
-    cos = torch.abs((normal_pred * normal_depth.detach()).sum(dim=1)).clamp(0.0, 1.0)
+    cos = torch.abs((normal_pred * normal_depth).sum(dim=1)).clamp(0.0, 1.0)
     loss = masked_mean(1.0 - cos, smooth_mask)
     metrics = {
         "normal_depth_cos": masked_mean(cos, smooth_mask).detach(),
