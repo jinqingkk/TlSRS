@@ -678,17 +678,23 @@ def edge_aware_smooth_loss(depth, ref_img, mask):
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     depth_loss_weights = kwargs.get("dlossw", None)
     imgs = kwargs.get("imgs", None)
+    proj_matrices = kwargs.get("proj_matrices", None)
     normal_smooth_loss_weight = kwargs.get("normal_smooth_loss_weight", 0.0)
     curv_loss_weight = kwargs.get("curv_loss_weight", 0.0)
     edge_smooth_loss_weight = kwargs.get("edge_smooth_loss_weight", 0.0)
+    depth_normal_loss_weight = kwargs.get("depth_normal_loss_weight", 0.0)
+    depth_normal_conf_threshold = kwargs.get("depth_normal_conf_threshold", 0.8)
+    edge_grad_threshold = kwargs.get("edge_grad_threshold", 0.05)
+    return_extra = kwargs.get("return_extra", False)
 
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    extra = {}
+    depth_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
 
     for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
         depth_est = stage_inputs["depth"]
         depth_gt = depth_gt_ms[stage_key]
-        mask = mask_ms[stage_key]
-        mask = mask > 0.5
+        mask = mask_ms[stage_key] > 0.5
 
         depth_loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], reduction='mean')
 
@@ -697,14 +703,38 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             total_loss += depth_loss_weights[stage_idx] * depth_loss
         else:
             total_loss += 1.0 * depth_loss
-        if int(stage_key.replace("stage", ""))>2:
+        if stage_key == "stage3":
             if normal_smooth_loss_weight > 0:
-                total_loss += normal_smooth_loss_weight * normal_smooth_loss(depth_est, mask)
+                loss_normal_smooth = normal_smooth_loss(depth_est, mask)
+                total_loss += normal_smooth_loss_weight * loss_normal_smooth
+                extra["normal_smooth_loss"] = loss_normal_smooth.detach()
             if curv_loss_weight > 0:
-                total_loss += curv_loss_weight * curvature_loss(depth_est, mask)
+                loss_curv = curvature_loss(depth_est, mask)
+                total_loss += curv_loss_weight * loss_curv
+                extra["curv_loss"] = loss_curv.detach()
             if edge_smooth_loss_weight > 0 and imgs is not None:
-                total_loss += edge_smooth_loss_weight * edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
+                loss_edge = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
+                total_loss += edge_smooth_loss_weight * loss_edge
+                extra["edge_smooth_loss"] = loss_edge.detach()
+            if (depth_normal_loss_weight > 0 and imgs is not None and proj_matrices is not None
+                    and "normal" in stage_inputs and "photometric_confidence" in stage_inputs):
+                intrinsics = proj_matrices["stage3"][:, 0, 1, :3, :3]
+                loss_depth_normal, dn_metrics, smooth_mask = depth_normal_consistency_loss(
+                    stage_inputs["normal"],
+                    depth_est,
+                    intrinsics,
+                    imgs[:, 0],
+                    mask,
+                    stage_inputs["photometric_confidence"],
+                    depth_normal_conf_threshold,
+                    edge_grad_threshold)
+                total_loss += depth_normal_loss_weight * loss_depth_normal
+                extra["depth_normal_loss"] = loss_depth_normal.detach()
+                extra.update(dn_metrics)
+                extra["smooth_mask"] = smooth_mask.detach()
 
+    if return_extra:
+        return total_loss, depth_loss, extra
     return total_loss, depth_loss
 
 

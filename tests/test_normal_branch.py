@@ -6,6 +6,7 @@ from models.module import (
     build_smooth_mask,
     non_edge_depth_grad_mean,
     depth_normal_consistency_loss,
+    cas_mvsnet_loss,
 )
 
 
@@ -297,3 +298,54 @@ def test_cascade_two_stage_model_does_not_output_normal_branch():
 
     assert "normal" not in outputs
     assert "normal" not in outputs["stage2"]
+
+
+def test_cas_mvsnet_loss_includes_depth_normal_metrics():
+    depth = torch.ones(1, 4, 5)
+    intrinsics = torch.eye(3).view(1, 1, 3, 3)
+    proj = torch.eye(4).view(1, 1, 1, 4, 4).repeat(1, 1, 2, 1, 1)
+    proj[:, 0, 1, :3, :3] = intrinsics[:, 0]
+    normal = compute_normal_from_depth(depth, intrinsics[:, 0])
+    inputs = {
+        "stage1": {"depth": torch.ones(1, 1, 2) * 1.0},
+        "stage2": {"depth": torch.ones(1, 2, 3) * 1.0},
+        "stage3": {
+            "depth": depth,
+            "photometric_confidence": torch.ones(1, 4, 5),
+            "normal": normal,
+        },
+        "depth": depth,
+        "photometric_confidence": torch.ones(1, 4, 5),
+        "normal": normal,
+    }
+    depth_gt_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+    mask_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+    proj_matrices = {"stage3": proj}
+    imgs = torch.zeros(1, 1, 3, 4, 5)
+
+    total_loss, depth_loss, extra = cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        proj_matrices=proj_matrices,
+        dlossw=[0.5, 1.0, 2.0],
+        depth_normal_loss_weight=0.03,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+        return_extra=True,
+    )
+
+    assert total_loss.item() < 1e-5
+    assert depth_loss.item() < 1e-5
+    assert extra["depth_normal_loss"].item() < 1e-5
+    assert extra["normal_depth_cos"].item() > 0.999
+    assert extra["smooth_mask_ratio"].item() > 0.999
