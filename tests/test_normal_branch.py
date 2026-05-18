@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from models.module import (
     NormalHead,
@@ -395,3 +396,90 @@ def test_cas_mvsnet_loss_skips_depth_normal_without_stage3_projection():
     assert total_loss.item() < 1e-5
     assert depth_loss.item() < 1e-5
     assert "depth_normal_loss" not in extra
+
+
+def test_cas_mvsnet_loss_uses_sorted_numeric_stage_keys_only():
+    stage1_depth = torch.ones(1, 1, 2) * 1.0
+    stage2_depth = torch.ones(1, 2, 3) * 1.0
+    stage3_depth = torch.ones(1, 4, 5) * 1.5
+    inputs = {
+        "stage2": {"depth": stage2_depth},
+        "not_a_stage_key": {},
+        "stage3": {"depth": stage3_depth},
+        "stage1": {"depth": stage1_depth},
+    }
+    depth_gt_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+    mask_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+
+    _, depth_loss, _ = cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        return_extra=True,
+    )
+
+    expected_stage3_loss = F.smooth_l1_loss(
+        stage3_depth.view(-1),
+        depth_gt_ms["stage3"].view(-1),
+        reduction='mean',
+    )
+    assert torch.allclose(depth_loss, expected_stage3_loss)
+
+
+def test_cas_mvsnet_loss_depth_normal_branch_backpropagates_to_depth_and_normal():
+    torch.manual_seed(5)
+    depth = 1.0 + torch.rand(1, 4, 5)
+    depth.requires_grad_()
+    normal = torch.zeros(1, 3, 4, 5)
+    normal[:, 2] = 1.0
+    normal.requires_grad_()
+    proj = torch.eye(4).view(1, 1, 1, 4, 4).repeat(1, 1, 2, 1, 1)
+    inputs = {
+        "stage1": {"depth": torch.ones(1, 1, 2)},
+        "stage2": {"depth": torch.ones(1, 2, 3)},
+        "stage3": {
+            "depth": depth,
+            "photometric_confidence": torch.ones(1, 4, 5),
+            "normal": normal,
+        },
+    }
+    depth_gt_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": depth.detach().clone(),
+    }
+    mask_ms = {
+        "stage1": torch.ones(1, 1, 2),
+        "stage2": torch.ones(1, 2, 3),
+        "stage3": torch.ones(1, 4, 5),
+    }
+    imgs = torch.zeros(1, 1, 3, 4, 5)
+
+    total_loss, depth_loss, extra = cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        proj_matrices={"stage3": proj},
+        dlossw=[0.0, 0.0, 0.0],
+        depth_normal_loss_weight=1.0,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+        return_extra=True,
+    )
+    total_loss.backward()
+
+    assert depth_loss.item() < 1e-6
+    assert extra["depth_normal_loss"].item() > 0.0
+    assert normal.grad is not None
+    assert depth.grad is not None
+    assert normal.grad.abs().sum().item() > 0.0
+    assert depth.grad.abs().sum().item() > 0.0

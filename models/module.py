@@ -691,7 +691,12 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     extra = {}
     depth_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
 
-    for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
+    stage_keys = [k for k in inputs.keys()
+                  if k.startswith("stage") and k.replace("stage", "").isdigit()]
+    stage_keys = sorted(stage_keys, key=lambda k: int(k.replace("stage", "")))
+
+    for stage_key in stage_keys:
+        stage_inputs = inputs[stage_key]
         depth_est = stage_inputs["depth"]
         depth_gt = depth_gt_ms[stage_key]
         mask = mask_ms[stage_key] > 0.5
