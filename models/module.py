@@ -499,6 +499,20 @@ class RefineNet(nn.Module):
         return depth_refined
 
 
+class NormalHead(nn.Module):
+    def __init__(self, in_channels, hidden_channels=32):
+        super(NormalHead, self).__init__()
+        self.conv1 = Conv2d(in_channels, hidden_channels, 3, 1, padding=1)
+        self.conv2 = Conv2d(hidden_channels, hidden_channels, 3, 1, padding=1)
+        self.conv3 = nn.Conv2d(hidden_channels, 3, 3, stride=1, padding=1, bias=True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        return F.normalize(x, p=2, dim=1, eps=1e-6)
+
+
 def depth_regression(p, depth_values):
     if depth_values.dim() <= 2:
         # print("regression dim <= 2")
@@ -523,6 +537,103 @@ def get_depth_normals(depth):
     dzdy = torch.cat((dzdy, dzdy[:, -1:, :]), dim=1)
     normal = torch.stack((-dzdx, -dzdy, torch.ones_like(depth)), dim=1)
     return F.normalize(normal, p=2, dim=1, eps=1e-6)
+
+
+def compute_normal_from_depth(depth, intrinsics):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    batch, height, width = depth.shape
+    fx = intrinsics[:, 0, 0].view(-1, 1, 1).clamp(min=1e-6)
+    fy = intrinsics[:, 1, 1].view(-1, 1, 1).clamp(min=1e-6)
+    cx = intrinsics[:, 0, 2].view(-1, 1, 1)
+    cy = intrinsics[:, 1, 2].view(-1, 1, 1)
+    x = torch.arange(width, dtype=depth.dtype, device=depth.device).view(1, 1, width)
+    y = torch.arange(height, dtype=depth.dtype, device=depth.device).view(1, height, 1)
+    x = x.expand(batch, height, width)
+    y = y.expand(batch, height, width)
+    points = torch.stack(((x - cx) / fx * depth,
+                          (y - cy) / fy * depth,
+                          depth), dim=1)
+    tangent_x = gradient_x(points)
+    tangent_y = gradient_y(points)
+    tangent_x = torch.cat((tangent_x, tangent_x[:, :, :, -1:]), dim=3)
+    tangent_y = torch.cat((tangent_y, tangent_y[:, :, -1:, :]), dim=2)
+    normal = torch.cross(tangent_x, tangent_y, dim=1)
+    return F.normalize(normal, p=2, dim=1, eps=1e-6)
+
+
+def image_gradient_magnitude(ref_img, target_size):
+    ref_img = F.interpolate(ref_img, size=target_size, mode='bilinear', align_corners=False)
+    img_dx = gradient_x(ref_img).abs().mean(dim=1)
+    img_dy = gradient_y(ref_img).abs().mean(dim=1)
+    grad = ref_img.new_zeros(ref_img.size(0), target_size[0], target_size[1])
+    grad[:, :, 1:] = torch.max(grad[:, :, 1:], img_dx)
+    grad[:, :, :-1] = torch.max(grad[:, :, :-1], img_dx)
+    grad[:, 1:, :] = torch.max(grad[:, 1:, :], img_dy)
+    grad[:, :-1, :] = torch.max(grad[:, :-1, :], img_dy)
+    return grad
+
+
+def build_smooth_mask(ref_img, valid_mask, confidence, depth_normal_conf_threshold,
+                      edge_grad_threshold, target_size):
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    if valid_mask.shape[-2:] != target_size:
+        valid_mask = F.interpolate(valid_mask.float().unsqueeze(1), size=target_size,
+                                   mode='nearest').squeeze(1)
+    valid_mask = valid_mask > 0.5
+    if confidence.dim() == 4:
+        confidence = confidence.squeeze(1)
+    if confidence.shape[-2:] != target_size:
+        confidence = F.interpolate(confidence.unsqueeze(1), size=target_size,
+                                   mode='bilinear', align_corners=False).squeeze(1)
+    high_confidence_mask = confidence > depth_normal_conf_threshold
+    edge_grad = image_gradient_magnitude(ref_img, target_size)
+    non_edge_mask = edge_grad < edge_grad_threshold
+    return valid_mask & high_confidence_mask & non_edge_mask
+
+
+def non_edge_depth_grad_mean(depth, smooth_mask):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    depth_dx = gradient_x(depth).abs()
+    depth_dy = gradient_y(depth).abs()
+    mask_x = smooth_mask[:, :, 1:] & smooth_mask[:, :, :-1]
+    mask_y = smooth_mask[:, 1:, :] & smooth_mask[:, :-1, :]
+    return 0.5 * (masked_mean(depth_dx, mask_x) + masked_mean(depth_dy, mask_y))
+
+
+def scale_intrinsics(intrinsics, source_size, target_size):
+    if source_size == target_size:
+        return intrinsics
+    scaled = intrinsics.clone()
+    scale_y = float(target_size[0]) / float(source_size[0])
+    scale_x = float(target_size[1]) / float(source_size[1])
+    scaled[:, 0, :] *= scale_x
+    scaled[:, 1, :] *= scale_y
+    return scaled
+
+
+def depth_normal_consistency_loss(normal_pred, depth_pred, intrinsics, ref_img, valid_mask,
+                                  confidence, depth_normal_conf_threshold=0.8,
+                                  edge_grad_threshold=0.05):
+    target_size = depth_pred.shape[-2:]
+    if normal_pred.shape[-2:] != target_size:
+        normal_pred = F.interpolate(normal_pred, size=target_size, mode='bilinear', align_corners=False)
+        normal_pred = F.normalize(normal_pred, p=2, dim=1, eps=1e-6)
+    smooth_mask = build_smooth_mask(ref_img, valid_mask, confidence,
+                                    depth_normal_conf_threshold,
+                                    edge_grad_threshold, target_size)
+    intrinsics = scale_intrinsics(intrinsics, ref_img.shape[-2:], target_size)
+    normal_depth = compute_normal_from_depth(depth_pred, intrinsics)
+    cos = torch.abs((normal_pred * normal_depth).sum(dim=1)).clamp(0.0, 1.0)
+    loss = masked_mean(1.0 - cos, smooth_mask)
+    metrics = {
+        "normal_depth_cos": masked_mean(cos, smooth_mask).detach(),
+        "smooth_mask_ratio": smooth_mask.float().mean().detach(),
+        "non_edge_depth_grad_mean": non_edge_depth_grad_mean(depth_pred.detach(), smooth_mask).detach(),
+    }
+    return loss, metrics, smooth_mask
 
 
 def masked_mean(value, mask):
@@ -567,17 +678,28 @@ def edge_aware_smooth_loss(depth, ref_img, mask):
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     depth_loss_weights = kwargs.get("dlossw", None)
     imgs = kwargs.get("imgs", None)
+    proj_matrices = kwargs.get("proj_matrices", None)
     normal_smooth_loss_weight = kwargs.get("normal_smooth_loss_weight", 0.0)
     curv_loss_weight = kwargs.get("curv_loss_weight", 0.0)
     edge_smooth_loss_weight = kwargs.get("edge_smooth_loss_weight", 0.0)
+    depth_normal_loss_weight = kwargs.get("depth_normal_loss_weight", 0.0)
+    depth_normal_conf_threshold = kwargs.get("depth_normal_conf_threshold", 0.8)
+    edge_grad_threshold = kwargs.get("edge_grad_threshold", 0.05)
+    return_extra = kwargs.get("return_extra", False)
 
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    extra = {}
+    depth_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
 
-    for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
+    stage_keys = [k for k in inputs.keys()
+                  if k.startswith("stage") and k.replace("stage", "").isdigit()]
+    stage_keys = sorted(stage_keys, key=lambda k: int(k.replace("stage", "")))
+
+    for stage_key in stage_keys:
+        stage_inputs = inputs[stage_key]
         depth_est = stage_inputs["depth"]
         depth_gt = depth_gt_ms[stage_key]
-        mask = mask_ms[stage_key]
-        mask = mask > 0.5
+        mask = mask_ms[stage_key] > 0.5
 
         depth_loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], reduction='mean')
 
@@ -594,13 +716,35 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         if normal_smooth_loss_weight > 0:
             normal_smooth_loss_final = normal_smooth_loss(depth_est, mask)
             total_loss += (normal_smooth_loss_weight/pow(2, stage_idx)) * normal_smooth_loss_final
+            extra["normal_smooth_loss"] = normal_smooth_loss_final.detach()
         if curv_loss_weight > 0:
             curvature_loss_final = curvature_loss(depth_est, mask)
             total_loss += (curv_loss_weight/pow(2, stage_idx)) * curvature_loss_final
+            extra["curv_loss"] = curvature_loss_final.detach()
         if edge_smooth_loss_weight > 0 and imgs is not None:
             edge_aware_smooth_loss_final = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
             total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
+            extra["edge_smooth_loss"] = edge_aware_smooth_loss_final.detach()
+        if (depth_normal_loss_weight > 0 and imgs is not None and proj_matrices is not None
+                and "stage3" in proj_matrices
+                and "normal" in stage_inputs and "photometric_confidence" in stage_inputs):
+            intrinsics = proj_matrices["stage3"][:, 0, 1, :3, :3]
+            loss_depth_normal, dn_metrics, smooth_mask = depth_normal_consistency_loss(
+                stage_inputs["normal"],
+                depth_est,
+                intrinsics,
+                imgs[:, 0],
+                mask,
+                stage_inputs["photometric_confidence"],
+                depth_normal_conf_threshold,
+                edge_grad_threshold)
+            total_loss += depth_normal_loss_weight * loss_depth_normal
+            extra["depth_normal_loss"] = loss_depth_normal.detach()
+            extra.update(dn_metrics)
+            extra["smooth_mask"] = smooth_mask.detach()
 
+    if return_extra:
+            return total_loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final, extra
     return total_loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final
 
 

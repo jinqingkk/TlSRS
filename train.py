@@ -49,9 +49,12 @@ parser.add_argument('--share_cr', action='store_true', help='whether share the c
 parser.add_argument('--ndepths', type=str, default="48,32,8", help='ndepths')
 parser.add_argument('--depth_inter_r', type=str, default="4,2,1", help='depth_intervals_ratio')
 parser.add_argument('--dlossw', type=str, default="0.5,1.0,2.0", help='depth loss weight for different stage')
-parser.add_argument('--normal_smooth_loss_weight', type=float, default=0.02, help='depth-normal consistency loss weight')
+parser.add_argument('--normal_smooth_loss_weight', type=float, default=0.02, help='normal smoothness loss weight')
 parser.add_argument('--curv_loss_weight', type=float, default=0.005, help='curvature continuity loss weight')
 parser.add_argument('--edge_smooth_loss_weight', type=float, default=0.005, help='edge-aware smooth loss weight')
+parser.add_argument('--depth_normal_loss_weight', type=float, default=0.03, help='depth-normal consistency loss weight')
+parser.add_argument('--depth_normal_conf_threshold', type=float, default=0.8, help='confidence threshold for depth-normal consistency')
+parser.add_argument('--edge_grad_threshold', type=float, default=0.05, help='image gradient threshold for non-edge normal consistency')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 
@@ -64,6 +67,22 @@ parser.add_argument('--loss-scale', type=str, default=None)
 
 num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
 is_distributed = num_gpus > 1
+
+
+def loss_kwargs(sample_cuda, args):
+    return {
+        "imgs": sample_cuda["imgs"],
+        "proj_matrices": sample_cuda["proj_matrices"],
+        "dlossw": [float(e) for e in args.dlossw.split(",") if e],
+        "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
+        "curv_loss_weight": args.curv_loss_weight,
+        "edge_smooth_loss_weight": args.edge_smooth_loss_weight,
+        "depth_normal_loss_weight": args.depth_normal_loss_weight,
+        "depth_normal_conf_threshold": args.depth_normal_conf_threshold,
+        "edge_grad_threshold": args.edge_grad_threshold,
+        "return_extra": True,
+    }
+
 
 # main function
 def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epoch, args):
@@ -163,11 +182,8 @@ def train_sample(model, model_loss, optimizer, sample, args):
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["depth_values"])
     depth_est = outputs["depth"]
 
-    loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final = model_loss(outputs, depth_gt_ms, mask_ms, imgs=sample_cuda["imgs"],
-                                  dlossw=[float(e) for e in args.dlossw.split(",") if e],
-                                  normal_smooth_loss_weight=args.normal_smooth_loss_weight,
-                                  curv_loss_weight=args.curv_loss_weight,
-                                  edge_smooth_loss_weight=args.edge_smooth_loss_weight)
+    loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final, loss_extra = model_loss(outputs, depth_gt_ms, mask_ms, **loss_kwargs(sample_cuda, args))
+
 
     if is_distributed and args.using_apex:
         with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -186,6 +202,7 @@ def train_sample(model, model_loss, optimizer, sample, args):
                       "thres2mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 2),
                       "thres4mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 4),
                       "thres8mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 8),}
+    scalar_outputs.update({k: v for k, v in loss_extra.items() if k != "smooth_mask"})
 
     image_outputs = {"depth_est": depth_est * mask,
                      "depth_est_nomask": depth_est,
@@ -194,6 +211,10 @@ def train_sample(model, model_loss, optimizer, sample, args):
                      "mask": sample["mask"]["stage1"],
                      "errormap": (depth_est - depth_gt).abs() * mask,
                      }
+    if "normal" in outputs:
+        image_outputs["normal_pred"] = (outputs["normal"] + 1.0) * 0.5
+    if "smooth_mask" in loss_extra:
+        image_outputs["smooth_mask"] = loss_extra["smooth_mask"].unsqueeze(1).float()
 
     if is_distributed:
         scalar_outputs = reduce_scalar_outputs(scalar_outputs)
@@ -220,17 +241,10 @@ def test_sample_depth(model, model_loss, sample, args):
     outputs = model_eval(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["depth_values"])
     depth_est = outputs["depth"]
 
-    loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final = model_loss(outputs, depth_gt_ms, mask_ms, imgs=sample_cuda["imgs"],
-                                  dlossw=[float(e) for e in args.dlossw.split(",") if e],
-                                  normal_smooth_loss_weight=args.normal_smooth_loss_weight,
-                                  curv_loss_weight=args.curv_loss_weight,
-                                  edge_smooth_loss_weight=args.edge_smooth_loss_weight)
+    loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final, loss_extra = model_loss(outputs, depth_gt_ms, mask_ms, **loss_kwargs(sample_cuda, args))
 
     scalar_outputs = {"loss": loss,
                       "depth_loss": depth_loss,
-                      "normal_smooth_loss": normal_smooth_loss_final,
-                      "curvature_loss": curvature_loss_final,
-                      "edge_aware_smooth_loss": edge_aware_smooth_loss_final,
                       "abs_depth_error": AbsDepthError_metrics(depth_est, depth_gt, mask > 0.5),
                       "thres2mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 2),
                       "thres4mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 4),
@@ -245,6 +259,7 @@ def test_sample_depth(model, model_loss, sample, args):
                       "thres20mm_abserror": AbsDepthError_metrics(depth_est, depth_gt, mask > 0.5, [14.0, 20.0]),
                       "thres>20mm_abserror": AbsDepthError_metrics(depth_est, depth_gt, mask > 0.5, [20.0, 1e5]),
                     }
+    scalar_outputs.update({k: v for k, v in loss_extra.items() if k != "smooth_mask"})
 
     image_outputs = {"depth_est": depth_est * mask,
                      "depth_est_nomask": depth_est,
@@ -252,6 +267,10 @@ def test_sample_depth(model, model_loss, sample, args):
                      "ref_img": sample["imgs"][:, 0],
                      "mask": sample["mask"]["stage1"],
                      "errormap": (depth_est - depth_gt).abs() * mask}
+    if "normal" in outputs:
+        image_outputs["normal_pred"] = (outputs["normal"] + 1.0) * 0.5
+    if "smooth_mask" in loss_extra:
+        image_outputs["smooth_mask"] = loss_extra["smooth_mask"].unsqueeze(1).float()
 
     if is_distributed:
         scalar_outputs = reduce_scalar_outputs(scalar_outputs)
@@ -365,7 +384,11 @@ if __name__ == '__main__':
         # load checkpoint file specified by args.loadckpt
         print("loading model {}".format(args.loadckpt))
         state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
-        model.load_state_dict(state_dict['model'])
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict['model'], strict=False)
+        if missing_keys:
+            print("missing keys when loading checkpoint:", missing_keys)
+        if unexpected_keys:
+            print("unexpected keys when loading checkpoint:", unexpected_keys)
 
     if (not is_distributed) or (dist.get_rank() == 0):
         print("start at epoch {}".format(start_epoch))
