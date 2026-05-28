@@ -1,0 +1,16 @@
+ ./train.sh 1 ./checkpoints/cas_dtu     --ndepths "48,32,8"     --depth_inter_r "4,2,1"     --dlossw "0.5,1.0,2.0"     --batch_size 2     --eval_freq 3
+
+
+
+# test-cmd
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jinqing002/miniconda3/envs/mvsnetpy37/lib/python3.7/site-packages/torch/lib:$LD_LIBRARY_PATH
+python test.py \
+  --dataset=general_eval \
+  --batch_size=1 \
+  --testpath=data/DTU/dtu_test_all \
+  --testlist=lists/dtu/test.txt \
+  --loadckpt=./checkpoints/cas_dtu/model_000015.ckpt \
+  --outdir=./outputs \
+  --interval_scale=1.06 \
+  --filter_method=gipuma
+

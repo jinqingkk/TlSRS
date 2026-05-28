@@ -49,9 +49,9 @@ parser.add_argument('--share_cr', action='store_true', help='whether share the c
 parser.add_argument('--ndepths', type=str, default="48,32,8", help='ndepths')
 parser.add_argument('--depth_inter_r', type=str, default="4,2,1", help='depth_intervals_ratio')
 parser.add_argument('--dlossw', type=str, default="0.5,1.0,2.0", help='depth loss weight for different stage')
-parser.add_argument('--normal_smooth_loss_weight', type=float, default=0.05, help='depth-normal consistency loss weight')
-parser.add_argument('--curv_loss_weight', type=float, default=0.02, help='curvature continuity loss weight')
-parser.add_argument('--edge_smooth_loss_weight', type=float, default=0.01, help='edge-aware smooth loss weight')
+parser.add_argument('--normal_smooth_loss_weight', type=float, default=0.02, help='depth-normal consistency loss weight')
+parser.add_argument('--curv_loss_weight', type=float, default=0.005, help='curvature continuity loss weight')
+parser.add_argument('--edge_smooth_loss_weight', type=float, default=0.005, help='edge-aware smooth loss weight')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 
@@ -163,7 +163,7 @@ def train_sample(model, model_loss, optimizer, sample, args):
     outputs = model(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["depth_values"])
     depth_est = outputs["depth"]
 
-    loss, depth_loss = model_loss(outputs, depth_gt_ms, mask_ms, imgs=sample_cuda["imgs"],
+    loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final = model_loss(outputs, depth_gt_ms, mask_ms, imgs=sample_cuda["imgs"],
                                   dlossw=[float(e) for e in args.dlossw.split(",") if e],
                                   normal_smooth_loss_weight=args.normal_smooth_loss_weight,
                                   curv_loss_weight=args.curv_loss_weight,
@@ -179,6 +179,9 @@ def train_sample(model, model_loss, optimizer, sample, args):
 
     scalar_outputs = {"loss": loss,
                       "depth_loss": depth_loss,
+                      "normal_smooth_loss": normal_smooth_loss_final,
+                      "curvature_loss": curvature_loss_final,
+                      "edge_aware_smooth_loss": edge_aware_smooth_loss_final,
                       "abs_depth_error": AbsDepthError_metrics(depth_est, depth_gt, mask > 0.5),
                       "thres2mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 2),
                       "thres4mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 4),
@@ -217,7 +220,7 @@ def test_sample_depth(model, model_loss, sample, args):
     outputs = model_eval(sample_cuda["imgs"], sample_cuda["proj_matrices"], sample_cuda["depth_values"])
     depth_est = outputs["depth"]
 
-    loss, depth_loss = model_loss(outputs, depth_gt_ms, mask_ms, imgs=sample_cuda["imgs"],
+    loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final = model_loss(outputs, depth_gt_ms, mask_ms, imgs=sample_cuda["imgs"],
                                   dlossw=[float(e) for e in args.dlossw.split(",") if e],
                                   normal_smooth_loss_weight=args.normal_smooth_loss_weight,
                                   curv_loss_weight=args.curv_loss_weight,
@@ -225,6 +228,9 @@ def test_sample_depth(model, model_loss, sample, args):
 
     scalar_outputs = {"loss": loss,
                       "depth_loss": depth_loss,
+                      "normal_smooth_loss": normal_smooth_loss_final,
+                      "curvature_loss": curvature_loss_final,
+                      "edge_aware_smooth_loss": edge_aware_smooth_loss_final,
                       "abs_depth_error": AbsDepthError_metrics(depth_est, depth_gt, mask > 0.5),
                       "thres2mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 2),
                       "thres4mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 4),

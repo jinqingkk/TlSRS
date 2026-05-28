@@ -586,15 +586,22 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             total_loss += depth_loss_weights[stage_idx] * depth_loss
         else:
             total_loss += 1.0 * depth_loss
-        if int(stage_key.replace("stage", ""))>2:
-            if normal_smooth_loss_weight > 0:
-                total_loss += normal_smooth_loss_weight * normal_smooth_loss(depth_est, mask)
-            if curv_loss_weight > 0:
-                total_loss += curv_loss_weight * curvature_loss(depth_est, mask)
-            if edge_smooth_loss_weight > 0 and imgs is not None:
-                total_loss += edge_smooth_loss_weight * edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
+        #  if int(stage_key.replace("stage", "")) > 2:
+        stage_idx = int(stage_key.replace("stage", "")) - 1
+        normal_smooth_loss_final = 0.0
+        curvature_loss_final = 0.0
+        edge_aware_smooth_loss_final = 0.0
+        if normal_smooth_loss_weight > 0:
+            normal_smooth_loss_final = normal_smooth_loss(depth_est, mask)
+            total_loss += (normal_smooth_loss_weight/pow(2, stage_idx)) * normal_smooth_loss_final
+        if curv_loss_weight > 0:
+            curvature_loss_final = curvature_loss(depth_est, mask)
+            total_loss += (curv_loss_weight/pow(2, stage_idx)) * curvature_loss_final
+        if edge_smooth_loss_weight > 0 and imgs is not None:
+            edge_aware_smooth_loss_final = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
+            total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
 
-    return total_loss, depth_loss
+    return total_loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final
 
 
 def get_cur_depth_range_samples(cur_depth, ndepth, depth_inteval_pixel, shape, max_depth=192.0, min_depth=0.0):

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .module1 import *
+from .module import *
 
 Align_Corners_Range = False
 
