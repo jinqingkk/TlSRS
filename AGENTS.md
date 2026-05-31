@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-This repository implements CasMVSNet training, evaluation, and data conversion utilities in Python/PyTorch. Core entry points live at the root: `train.py`, `test.py`, `train.sh`, `test.sh`, `colmap2mvsnet.py`, and `gipuma.py`; `train1.py` appears to be an alternate local training script and should be treated cautiously until its role is confirmed. Network definitions are in `models/`, with `models/cas_mvsnet.py` containing the cascade model and `models/module.py` containing shared layers, geometry utilities, and the active loss/normal helpers; `models/module1.py` is an alternate module variant. Dataset loaders and I/O helpers are in `datasets/`; DTU split files are in `lists/dtu/`. MATLAB DTU evaluation scripts are under `evaluations/dtu/`. Large local data, checkpoints, and generated outputs should stay outside versioned source or under ignored paths such as `data/`, `checkpoints/`, and `outputs/`.
+This repository implements CasMVSNet training, evaluation, and data conversion utilities in Python/PyTorch. Core entry points live at the root: `train.py`, `test.py`, `train.sh`, `test.sh`, `colmap2mvsnet.py`, and `gipuma.py`; `train1.py` appears to be an alternate local training script and should be treated cautiously until its role is confirmed. Network definitions are in `models/`, with `models/cas_mvsnet.py` containing the cascade model and `models/module.py` containing the active shared layers, geometry utilities, loss functions, and normal helpers; `models/module1.py` is an alternate module variant that is not imported by the current cascade model. Dataset loaders and I/O helpers are in `datasets/`; DTU split files are in `lists/dtu/`, including `test2.txt` for an additional small test list. MATLAB DTU evaluation scripts are under `evaluations/dtu/`. Large local data, checkpoints, and generated outputs should stay outside versioned source or under ignored paths such as `data/`, `checkpoints/`, and `outputs/`.
 
 ## CasMVSNet Network Flow
 
-The active cascade network is `CascadeMVSNet` in `models/cas_mvsnet.py`. In this checkout it imports layer, warping, regression, and loss helpers from `models/module1.py`; `models/module.py` contains a closely related helper set plus additional normal, curvature, and edge-aware loss utilities. Check the import in `models/cas_mvsnet.py` before changing shared model behavior, because edits in `models/module.py` will not affect the current model unless the import is switched.
+The active cascade network is `CascadeMVSNet` in `models/cas_mvsnet.py`. In this checkout it imports layer, warping, regression, normal-head, and loss helpers from `models/module.py`. Check the import in `models/cas_mvsnet.py` before changing shared model behavior, because `models/module1.py` is a nearby alternate implementation but is not active unless the import is changed.
 
 Runtime inputs follow the dataset output contract used by `train.py` and `test.py`: `imgs` has shape `(B, N, 3, H, W)`, `proj_matrices` is a stage-keyed dictionary such as `stage1`, `stage2`, `stage3`, and `depth_values` is the initial per-batch depth hypothesis range. `CascadeMVSNet.forward()` first records the global depth min, max, and interval from `depth_values`, then extracts multi-scale image features for every view with `FeatureNet`.
 
@@ -16,9 +16,11 @@ For each stage, `CascadeMVSNet` selects that stage's view features and projectio
 
 `DepthNet` performs the per-stage depth estimation. It treats view 0 as the reference view, repeats the reference feature across the depth dimension, homography-warps each source feature into the reference camera for every depth hypothesis with `homo_warping()`, and aggregates all view volumes by variance. The resulting cost volume is regularized by either a per-stage `CostRegNet` or a shared one when `--share_cr` is enabled. `CostRegNet` is a 3D encoder-decoder that outputs a single-channel cost volume.
 
-The regularized cost volume is squeezed to `(B, D, H, W)`, optionally combined with an initial probability volume, normalized with softmax over depth, and converted to a depth map by `depth_regression()`. `DepthNet` also computes `photometric_confidence` from a local depth-probability average around the regressed depth index. Each stage returns `depth` and `photometric_confidence`; `CascadeMVSNet` stores them under `outputs["stage1"]`, `outputs["stage2"]`, `outputs["stage3"]`, and also updates top-level `outputs["depth"]` and `outputs["photometric_confidence"]` with the latest stage. After the final `stage3` depth and confidence are available, the normal branch concatenates the `stage3` reference feature, final depth, and final confidence, then predicts `outputs["normal"]` as a unit-length `(B, 3, H, W)` surface normal map.
+The regularized cost volume is squeezed to `(B, D, H, W)`, optionally combined with an initial probability volume, normalized with softmax over depth, and converted to a depth map by `depth_regression()`. `DepthNet` also computes `photometric_confidence` from a local depth-probability average around the regressed depth index. Each stage returns `depth` and `photometric_confidence`; `CascadeMVSNet` stores them under `outputs["stage1"]`, `outputs["stage2"]`, `outputs["stage3"]`, and also updates top-level `outputs["depth"]` and `outputs["photometric_confidence"]` with the latest stage. Every active cascade stage has its own normal head. The normal branch concatenates that stage's reference feature, stage depth, and stage confidence, then predicts `outputs[stage_key]["normal"]` as a unit-length `(B, 3, H, W)` surface normal map at the stage resolution. The top-level `outputs["normal"]` is still updated by the latest stage, so in the default three-stage model it is the stage3 normal map.
 
-The final output depth is therefore the finest stage depth unless `refine=True` is enabled. The refinement path exists as `RefineNet`, which predicts a residual from the reference RGB image and the current depth, but the training and testing entry points instantiate `CascadeMVSNet(refine=False)` by default. Training computes multi-stage smooth L1 depth supervision through `cas_mvsnet_loss`; command-line weights such as `--dlossw` control stage weighting. The current `train.py` also passes normal, curvature, and edge-aware loss weights, but those extra arguments only affect training if the active imported loss implementation consumes them.
+The final output depth is therefore the finest stage depth unless `refine=True` is enabled. The refinement path exists as `RefineNet`, which predicts a residual from the reference RGB image and the current depth, but the training and testing entry points instantiate `CascadeMVSNet(refine=False)` by default. Training computes multi-stage smooth L1 depth supervision through `cas_mvsnet_loss`; command-line weights such as `--dlossw` control depth loss weighting for each stage.
+
+`cas_mvsnet_loss` also consumes the normal and smoothness options passed by `train.py`. `--normal_smooth_loss_weight`, `--curv_loss_weight`, and `--edge_smooth_loss_weight` are applied to every numeric cascade stage and divided by `2 ** stage_idx`, so stage1 receives the full base weight, stage2 receives half, and stage3 receives one quarter. With the current defaults, the base weights are `0.02`, `0.005`, and `0.005`. The depth-normal consistency term is enabled by `--depth_normal_loss_weight`, uses the current stage's predicted normal, predicted depth, photometric confidence, reference image gradients, and camera intrinsics, and is weighted with the same `1 / 2 ** stage_idx` stage decay. The mask for this term keeps valid, high-confidence, non-edge pixels according to `--depth_normal_conf_threshold` and `--edge_grad_threshold`. Training and validation log extra scalar metrics such as `normal_smooth_loss`, `curv_loss`, `edge_smooth_loss`, `depth_normal_loss`, `normal_depth_cos`, `smooth_mask_ratio`, and `non_edge_depth_grad_mean`; image summaries may include the latest-stage `normal_pred` and `smooth_mask`.
 
 ## Build, Test, and Development Commands
 
@@ -28,16 +30,18 @@ Install dependencies in an isolated environment. This checkout does not currentl
 pip install torch torchvision tensorboardX opencv-python scipy pillow plyfile
 ```
 
-Train on DTU after setting `MVS_TRAINING` inside `train.sh`:
+Train on DTU after setting `MVS_TRAINING` inside `train.sh`. The shell scripts are currently stored without executable permission, so run them through `bash` unless you first restore the executable bit:
 
 ```bash
-./train.sh 8 ./checkpoints --ndepths "48,32,8" --depth_inter_r "4,2,1" --batch_size 2
+bash train.sh 8 ./checkpoints --ndepths "48,32,8" --depth_inter_r "4,2,1" --batch_size 2
 ```
+
+The repository also includes `cmdexplain.txt` with a recorded one-GPU training example using `./checkpoints/cas_dtu`, `--dlossw "0.5,1.0,2.0"`, `--batch_size 2`, and `--eval_freq 3`.
 
 Run inference/fusion after setting `TESTPATH` in `test.sh` and providing a checkpoint:
 
 ```bash
-./test.sh ./checkpoints/casmvsnet.ckpt --outdir ./outputs --interval_scale 1.06
+bash test.sh ./checkpoints/casmvsnet.ckpt --outdir ./outputs --interval_scale 1.06
 ```
 
 Convert a COLMAP dense reconstruction to CasMVSNet input:

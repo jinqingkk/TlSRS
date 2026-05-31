@@ -105,7 +105,9 @@ class CascadeMVSNet(nn.Module):
         if self.refine:
             self.refine_network = RefineNet()
         self.DepthNet = DepthNet()
-        self.normal_head = NormalHead(self.feature.out_channels[-1] + 2)
+        self.normal_head = nn.ModuleList([
+            NormalHead(out_channels + 2) for out_channels in self.feature.out_channels[:self.num_stage]
+        ])
 
     def forward(self, imgs, proj_matrices, depth_values):
         depth_min = float(depth_values[0, 0].cpu().numpy())
@@ -155,20 +157,19 @@ class CascadeMVSNet(nn.Module):
                                           cost_regularization=self.cost_regularization if self.share_cr else self.cost_regularization[stage_idx])
 
             depth = outputs_stage['depth']
-            if stage_key == "stage3":
-                final_ref_feature = features_stage[0]
-                depth_input = depth.unsqueeze(1)
-                confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
-                if depth_input.shape[-2:] != final_ref_feature.shape[-2:]:
-                    depth_input = F.interpolate(depth_input, size=final_ref_feature.shape[-2:],
-                                                mode='bilinear',
-                                                align_corners=Align_Corners_Range)
-                if confidence_input.shape[-2:] != final_ref_feature.shape[-2:]:
-                    confidence_input = F.interpolate(confidence_input, size=final_ref_feature.shape[-2:],
-                                                     mode='bilinear',
-                                                     align_corners=Align_Corners_Range)
-                normal_input = torch.cat([final_ref_feature, depth_input, confidence_input], dim=1)
-                outputs_stage["normal"] = self.normal_head(normal_input)
+            ref_feature = features_stage[0]
+            depth_input = depth.unsqueeze(1)
+            confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
+            if depth_input.shape[-2:] != ref_feature.shape[-2:]:
+                depth_input = F.interpolate(depth_input, size=ref_feature.shape[-2:],
+                                            mode='bilinear',
+                                            align_corners=Align_Corners_Range)
+            if confidence_input.shape[-2:] != ref_feature.shape[-2:]:
+                confidence_input = F.interpolate(confidence_input, size=ref_feature.shape[-2:],
+                                                 mode='bilinear',
+                                                 align_corners=Align_Corners_Range)
+            normal_input = torch.cat([ref_feature, depth_input, confidence_input], dim=1)
+            outputs_stage["normal"] = self.normal_head[stage_idx](normal_input)
 
             outputs[stage_key] = outputs_stage
             outputs.update(outputs_stage)

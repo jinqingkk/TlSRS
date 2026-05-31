@@ -262,7 +262,11 @@ def _identity_proj(batch, views):
     return proj
 
 
-def test_cascade_outputs_stage3_normal_branch():
+def _unpack_loss_result(result):
+    return result[0], result[1], result[-1]
+
+
+def test_cascade_outputs_normal_branch_for_every_stage():
     torch.manual_seed(2)
     model = CascadeMVSNet(ndepths=[8, 8, 8], depth_interals_ratio=[4, 2, 1])
     model.eval()
@@ -277,14 +281,21 @@ def test_cascade_outputs_stage3_normal_branch():
     with torch.no_grad():
         outputs = model(imgs, proj_matrices, depth_values)
 
+    expected_shapes = {
+        "stage1": (1, 3, 8, 8),
+        "stage2": (1, 3, 16, 16),
+        "stage3": (1, 3, 32, 32),
+    }
+    for stage_key, expected_shape in expected_shapes.items():
+        assert "normal" in outputs[stage_key]
+        assert outputs[stage_key]["normal"].shape == expected_shape
+        norm = torch.norm(outputs[stage_key]["normal"], p=2, dim=1)
+        assert torch.allclose(norm, torch.ones_like(norm), atol=1e-4)
     assert "normal" in outputs
-    assert "normal" in outputs["stage3"]
-    assert outputs["normal"].shape == (1, 3, 32, 32)
-    norm = torch.norm(outputs["normal"], p=2, dim=1)
-    assert torch.allclose(norm, torch.ones_like(norm), atol=1e-4)
+    assert outputs["normal"].shape == expected_shapes["stage3"]
 
 
-def test_cascade_two_stage_model_does_not_output_normal_branch():
+def test_cascade_two_stage_model_outputs_normal_for_active_stages():
     torch.manual_seed(3)
     model = CascadeMVSNet(ndepths=[8, 8], depth_interals_ratio=[4, 2])
     model.eval()
@@ -298,8 +309,12 @@ def test_cascade_two_stage_model_does_not_output_normal_branch():
     with torch.no_grad():
         outputs = model(imgs, proj_matrices, depth_values)
 
-    assert "normal" not in outputs
-    assert "normal" not in outputs["stage2"]
+    assert "normal" in outputs["stage1"]
+    assert "normal" in outputs["stage2"]
+    assert outputs["stage1"]["normal"].shape == (1, 3, 8, 8)
+    assert outputs["stage2"]["normal"].shape == (1, 3, 16, 16)
+    assert "normal" in outputs
+    assert outputs["normal"].shape == (1, 3, 16, 16)
 
 
 def test_cascade_model_loads_depth_only_checkpoint_with_missing_normal_head():
@@ -344,7 +359,7 @@ def test_cas_mvsnet_loss_includes_depth_normal_metrics():
     proj_matrices = {"stage3": proj}
     imgs = torch.zeros(1, 1, 3, 4, 5)
 
-    total_loss, depth_loss, extra = cas_mvsnet_loss(
+    total_loss, depth_loss, extra = _unpack_loss_result(cas_mvsnet_loss(
         inputs,
         depth_gt_ms,
         mask_ms,
@@ -355,7 +370,7 @@ def test_cas_mvsnet_loss_includes_depth_normal_metrics():
         depth_normal_conf_threshold=0.8,
         edge_grad_threshold=0.05,
         return_extra=True,
-    )
+    ))
 
     assert total_loss.item() < 1e-5
     assert depth_loss.item() < 1e-5
@@ -392,7 +407,7 @@ def test_cas_mvsnet_loss_skips_depth_normal_without_stage3_projection():
     }
     imgs = torch.zeros(1, 1, 3, 4, 5)
 
-    total_loss, depth_loss, extra = cas_mvsnet_loss(
+    total_loss, depth_loss, extra = _unpack_loss_result(cas_mvsnet_loss(
         inputs,
         depth_gt_ms,
         mask_ms,
@@ -403,7 +418,7 @@ def test_cas_mvsnet_loss_skips_depth_normal_without_stage3_projection():
         depth_normal_conf_threshold=0.8,
         edge_grad_threshold=0.05,
         return_extra=True,
-    )
+    ))
 
     assert total_loss.item() < 1e-5
     assert depth_loss.item() < 1e-5
@@ -431,12 +446,12 @@ def test_cas_mvsnet_loss_uses_sorted_numeric_stage_keys_only():
         "stage3": torch.ones(1, 4, 5),
     }
 
-    _, depth_loss, _ = cas_mvsnet_loss(
+    _, depth_loss, _ = _unpack_loss_result(cas_mvsnet_loss(
         inputs,
         depth_gt_ms,
         mask_ms,
         return_extra=True,
-    )
+    ))
 
     expected_stage3_loss = F.smooth_l1_loss(
         stage3_depth.view(-1),
@@ -475,7 +490,7 @@ def test_cas_mvsnet_loss_depth_normal_branch_backpropagates_to_depth_and_normal(
     }
     imgs = torch.zeros(1, 1, 3, 4, 5)
 
-    total_loss, depth_loss, extra = cas_mvsnet_loss(
+    total_loss, depth_loss, extra = _unpack_loss_result(cas_mvsnet_loss(
         inputs,
         depth_gt_ms,
         mask_ms,
@@ -486,7 +501,7 @@ def test_cas_mvsnet_loss_depth_normal_branch_backpropagates_to_depth_and_normal(
         depth_normal_conf_threshold=0.8,
         edge_grad_threshold=0.05,
         return_extra=True,
-    )
+    ))
     total_loss.backward()
 
     assert depth_loss.item() < 1e-6
@@ -495,3 +510,38 @@ def test_cas_mvsnet_loss_depth_normal_branch_backpropagates_to_depth_and_normal(
     assert depth.grad is not None
     assert normal.grad.abs().sum().item() > 0.0
     assert depth.grad.abs().sum().item() > 0.0
+
+
+def test_cas_mvsnet_loss_uses_current_stage_projection_for_depth_normal():
+    depth = torch.ones(1, 2, 3)
+    intrinsics = torch.eye(3).view(1, 1, 3, 3)
+    normal = compute_normal_from_depth(depth, intrinsics[:, 0])
+    proj = torch.eye(4).view(1, 1, 1, 4, 4).repeat(1, 1, 2, 1, 1)
+    proj[:, 0, 1, :3, :3] = intrinsics[:, 0]
+    inputs = {
+        "stage1": {
+            "depth": depth,
+            "photometric_confidence": torch.ones(1, 2, 3),
+            "normal": normal,
+        },
+    }
+    depth_gt_ms = {"stage1": depth.detach().clone()}
+    mask_ms = {"stage1": torch.ones(1, 2, 3)}
+    imgs = torch.zeros(1, 1, 3, 2, 3)
+
+    result = cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        proj_matrices={"stage1": proj},
+        dlossw=[0.0],
+        depth_normal_loss_weight=1.0,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+        return_extra=True,
+    )
+
+    extra = result[-1]
+    assert "depth_normal_loss" in extra
+    assert extra["depth_normal_loss"].item() < 1e-5

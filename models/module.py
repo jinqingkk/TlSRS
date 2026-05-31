@@ -726,9 +726,9 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
             extra["edge_smooth_loss"] = edge_aware_smooth_loss_final.detach()
         if (depth_normal_loss_weight > 0 and imgs is not None and proj_matrices is not None
-                and "stage3" in proj_matrices
+                and stage_key in proj_matrices
                 and "normal" in stage_inputs and "photometric_confidence" in stage_inputs):
-            intrinsics = proj_matrices["stage3"][:, 0, 1, :3, :3]
+            intrinsics = proj_matrices[stage_key][:, 0, 1, :3, :3]
             loss_depth_normal, dn_metrics, smooth_mask = depth_normal_consistency_loss(
                 stage_inputs["normal"],
                 depth_est,
@@ -738,7 +738,7 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 stage_inputs["photometric_confidence"],
                 depth_normal_conf_threshold,
                 edge_grad_threshold)
-            total_loss += depth_normal_loss_weight * loss_depth_normal
+            total_loss += (depth_normal_loss_weight / pow(2, stage_idx)) * loss_depth_normal
             extra["depth_normal_loss"] = loss_depth_normal.detach()
             extra.update(dn_metrics)
             extra["smooth_mask"] = smooth_mask.detach()
