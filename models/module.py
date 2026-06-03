@@ -713,12 +713,20 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         normal_smooth_loss_final = 0.0
         curvature_loss_final = 0.0
         edge_aware_smooth_loss_final = 0.0
+        geometry_mask = None
+        if imgs is not None and "photometric_confidence" in stage_inputs:
+            geometry_mask = build_smooth_mask(imgs[:, 0], mask, stage_inputs["photometric_confidence"],
+                                              depth_normal_conf_threshold,
+                                              edge_grad_threshold,
+                                              depth_est.shape[-2:])
+            extra["geometry_mask_ratio"] = geometry_mask.float().mean().detach()
         if normal_smooth_loss_weight > 0:
             normal_smooth_loss_final = normal_smooth_loss(depth_est, mask)
             total_loss += (normal_smooth_loss_weight/pow(2, stage_idx)) * normal_smooth_loss_final
             extra["normal_smooth_loss"] = normal_smooth_loss_final.detach()
         if curv_loss_weight > 0:
-            curvature_loss_final = curvature_loss(depth_est, mask)
+            curvature_mask = geometry_mask if geometry_mask is not None else mask
+            curvature_loss_final = curvature_loss(depth_est, curvature_mask)
             total_loss += (curv_loss_weight/pow(2, stage_idx)) * curvature_loss_final
             extra["curv_loss"] = curvature_loss_final.detach()
         if edge_smooth_loss_weight > 0 and imgs is not None:

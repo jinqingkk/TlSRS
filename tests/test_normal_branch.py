@@ -545,3 +545,32 @@ def test_cas_mvsnet_loss_uses_current_stage_projection_for_depth_normal():
     extra = result[-1]
     assert "depth_normal_loss" in extra
     assert extra["depth_normal_loss"].item() < 1e-5
+
+
+def test_cas_mvsnet_loss_applies_curvature_only_on_high_confidence_non_edge_mask():
+    depth = torch.tensor([[[1.0, 1.0, 4.0, 1.0, 1.0]]])
+    confidence = torch.ones(1, 1, 5)
+    confidence[:, :, 2] = 0.1
+    inputs = {
+        "stage1": {
+            "depth": depth,
+            "photometric_confidence": confidence,
+        },
+    }
+    depth_gt_ms = {"stage1": depth.clone()}
+    mask_ms = {"stage1": torch.ones(1, 1, 5)}
+    imgs = torch.zeros(1, 1, 3, 1, 5)
+
+    _, _, extra = _unpack_loss_result(cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        dlossw=[0.0],
+        curv_loss_weight=1.0,
+        depth_normal_conf_threshold=0.8,
+        edge_grad_threshold=0.05,
+        return_extra=True,
+    ))
+
+    assert extra["curv_loss"].item() < 1e-6
