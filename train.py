@@ -55,6 +55,11 @@ parser.add_argument('--edge_smooth_loss_weight', type=float, default=0.005, help
 parser.add_argument('--depth_normal_loss_weight', type=float, default=0.03, help='depth-normal consistency loss weight')
 parser.add_argument('--depth_normal_conf_threshold', type=float, default=0.8, help='confidence threshold for depth-normal consistency')
 parser.add_argument('--edge_grad_threshold', type=float, default=0.05, help='image gradient threshold for non-edge normal consistency')
+parser.add_argument('--geometry_conf_mid', type=float, default=0.65, help='confidence midpoint for soft geometry weight')
+parser.add_argument('--geometry_k_conf', type=float, default=10.0, help='confidence sigmoid slope for soft geometry weight')
+parser.add_argument('--geometry_edge_mid', type=float, default=0.25, help='image gradient midpoint for soft geometry weight')
+parser.add_argument('--geometry_k_edge', type=float, default=10.0, help='edge sigmoid slope for soft geometry weight')
+parser.add_argument('--geometry_w_min', type=float, default=0.05, help='minimum soft geometry weight on valid depth')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 
@@ -80,6 +85,11 @@ def loss_kwargs(sample_cuda, args):
         "depth_normal_loss_weight": args.depth_normal_loss_weight,
         "depth_normal_conf_threshold": args.depth_normal_conf_threshold,
         "edge_grad_threshold": args.edge_grad_threshold,
+        "geometry_conf_mid": args.geometry_conf_mid,
+        "geometry_k_conf": args.geometry_k_conf,
+        "geometry_edge_mid": args.geometry_edge_mid,
+        "geometry_k_edge": args.geometry_k_edge,
+        "geometry_w_min": args.geometry_w_min,
         "return_extra": True,
     }
 

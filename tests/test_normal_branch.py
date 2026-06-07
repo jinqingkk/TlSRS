@@ -5,7 +5,10 @@ from models.module import (
     NormalHead,
     compute_normal_from_depth,
     build_smooth_mask,
+    build_geometry_weight,
     non_edge_depth_grad_mean,
+    curvature_loss,
+    soft_curvature_loss,
     depth_normal_consistency_loss,
     cas_mvsnet_loss,
 )
@@ -120,6 +123,39 @@ def test_build_smooth_mask_accepts_float_mask_and_4d_confidence_at_target_size()
     assert not smooth_mask[1, 1, 2]
     assert smooth_mask[0, 2, 2]
     assert smooth_mask[1, 0, 0]
+
+
+def test_build_geometry_weight_softly_downweights_low_confidence_and_edges():
+    ref_img = torch.zeros(1, 3, 4, 6)
+    ref_img[:, :, :, 3:] = 1.0
+    valid_mask = torch.ones(1, 4, 6, dtype=torch.bool)
+    valid_mask[:, 0, 0] = False
+    confidence = torch.ones(1, 1, 4, 6)
+    confidence[:, :, :, 0] = 0.1
+
+    geometry_weight, metrics = build_geometry_weight(
+        ref_img,
+        valid_mask,
+        confidence,
+        target_size=(4, 6),
+        conf_mid=0.65,
+        k_conf=10.0,
+        edge_mid=0.25,
+        k_edge=10.0,
+        w_min=0.05,
+    )
+
+    assert geometry_weight.shape == (1, 4, 6)
+    assert geometry_weight.dtype == ref_img.dtype
+    assert geometry_weight[:, 0, 0].item() == 0.0
+    assert geometry_weight[:, 1:, 0].min().item() > 0.0
+    assert geometry_weight[:, 1:, 0].max().item() < 0.2
+    assert geometry_weight[:, :, 2:4].max().item() < geometry_weight[:, :, 4:].min().item()
+    assert geometry_weight[:, :, 4:].min().item() > 0.9
+    assert metrics["geometry_weight_mean"].item() > 0.0
+    assert metrics["geometry_weight_valid_mean"].item() >= 0.05
+    assert metrics["high_weight_ratio"].item() > 0.0
+    assert metrics["low_weight_ratio"].item() > 0.0
 
 
 def test_non_edge_depth_grad_mean_accepts_4d_depth():
@@ -461,6 +497,38 @@ def test_cas_mvsnet_loss_uses_sorted_numeric_stage_keys_only():
     assert torch.allclose(depth_loss, expected_stage3_loss)
 
 
+def test_soft_curvature_loss_uses_weighted_second_order_stencil():
+    depth = torch.tensor([[[1.0, 1.0, 4.0, 1.0, 1.0]]])
+    weight = torch.tensor([[[1.0, 0.5, 0.5, 1.0, 1.0]]])
+
+    loss = soft_curvature_loss(depth, weight)
+
+    depth_mean = (depth * weight).sum() / weight.sum()
+    depth_norm = depth / depth_mean
+    curv_x = (depth_norm[:, :, 2:] - 2 * depth_norm[:, :, 1:-1] + depth_norm[:, :, :-2]).abs()
+    stencil_weight = torch.min(torch.min(weight[:, :, 2:], weight[:, :, 1:-1]), weight[:, :, :-2])
+    expected = (curv_x * stencil_weight).sum() / (stencil_weight.sum() + 1e-6)
+    assert torch.allclose(loss, expected)
+
+
+def test_soft_geometry_weight_does_not_backpropagate_through_confidence():
+    depth = torch.tensor([[[1.0, 1.0, 4.0, 1.0, 2.0]]], requires_grad=True)
+    confidence = torch.tensor([[[0.2, 0.4, 0.6, 0.8, 1.0]]], requires_grad=True)
+    geometry_weight, _ = build_geometry_weight(
+        torch.zeros(1, 3, 1, 5),
+        torch.ones(1, 1, 5),
+        confidence,
+        target_size=(1, 5),
+    )
+
+    loss = soft_curvature_loss(depth, geometry_weight)
+    loss.backward()
+
+    assert depth.grad is not None
+    assert depth.grad.abs().sum().item() > 0.0
+    assert confidence.grad is None
+
+
 def test_cas_mvsnet_loss_depth_normal_branch_backpropagates_to_depth_and_normal():
     torch.manual_seed(5)
     depth = 1.0 + torch.rand(1, 4, 5)
@@ -547,7 +615,7 @@ def test_cas_mvsnet_loss_uses_current_stage_projection_for_depth_normal():
     assert extra["depth_normal_loss"].item() < 1e-5
 
 
-def test_cas_mvsnet_loss_applies_curvature_only_on_high_confidence_non_edge_mask():
+def test_cas_mvsnet_loss_uses_soft_geometry_weight_for_curvature_metrics():
     depth = torch.tensor([[[1.0, 1.0, 4.0, 1.0, 1.0]]])
     confidence = torch.ones(1, 1, 5)
     confidence[:, :, 2] = 0.1
@@ -573,4 +641,50 @@ def test_cas_mvsnet_loss_applies_curvature_only_on_high_confidence_non_edge_mask
         return_extra=True,
     ))
 
-    assert extra["curv_loss"].item() < 1e-6
+    assert extra["curv_loss"].item() > 0.0
+    expected_raw = curvature_loss(depth, mask_ms["stage1"] > 0.5)
+    assert torch.allclose(extra["stage1/curvature_loss_raw"], expected_raw)
+    assert torch.allclose(extra["curvature_loss_raw"], 0.5 * expected_raw)
+    assert torch.allclose(extra["curvature_loss_weighted"], extra["curv_loss"])
+    assert extra["geometry_weight_mean"].item() > 0.0
+    assert extra["geometry_weight_valid_mean"].item() >= 0.05
+    assert extra["high_weight_ratio"].item() > 0.0
+    assert extra["low_weight_ratio"].item() > 0.0
+    assert "stage1/geometry_weight_mean" in extra
+
+
+def test_cas_mvsnet_loss_uses_requested_multistage_curvature_weights():
+    stage_depths = {
+        "stage1": torch.tensor([[[1.0, 1.0, 2.0, 1.0, 1.0]]]),
+        "stage2": torch.tensor([[[1.0, 1.0, 3.0, 1.0, 1.0]]]),
+        "stage3": torch.tensor([[[1.0, 1.0, 4.0, 1.0, 1.0]]]),
+    }
+    inputs = {
+        stage_key: {
+            "depth": depth,
+            "photometric_confidence": torch.ones_like(depth),
+        }
+        for stage_key, depth in stage_depths.items()
+    }
+    depth_gt_ms = {stage_key: depth.clone() for stage_key, depth in stage_depths.items()}
+    mask_ms = {stage_key: torch.ones_like(depth) for stage_key, depth in stage_depths.items()}
+    imgs = torch.zeros(1, 1, 3, 1, 5)
+
+    total_loss, _, extra = _unpack_loss_result(cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        dlossw=[0.0, 0.0, 0.0],
+        curv_loss_weight=1.0,
+        return_extra=True,
+    ))
+
+    expected = (
+        0.5 * extra["stage1/curvature_loss_weighted"]
+        + 1.0 * extra["stage2/curvature_loss_weighted"]
+        + 1.5 * extra["stage3/curvature_loss_weighted"]
+    )
+    assert torch.allclose(extra["curvature_loss_weighted"], expected)
+    assert torch.allclose(extra["curv_loss"], expected)
+    assert torch.allclose(total_loss, expected)

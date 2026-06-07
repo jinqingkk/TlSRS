@@ -593,6 +593,38 @@ def build_smooth_mask(ref_img, valid_mask, confidence, depth_normal_conf_thresho
     return valid_mask & high_confidence_mask & non_edge_mask
 
 
+def build_geometry_weight(ref_img, valid_mask, confidence, target_size,
+                          conf_mid=0.65, k_conf=10.0,
+                          edge_mid=0.25, k_edge=10.0, w_min=0.05):
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    if valid_mask.shape[-2:] != target_size:
+        valid_mask = F.interpolate(valid_mask.float().unsqueeze(1), size=target_size,
+                                   mode='nearest').squeeze(1)
+    valid_weight = (valid_mask > 0.5).float()
+
+    if confidence.dim() == 4:
+        confidence = confidence.squeeze(1)
+    confidence = confidence.detach()
+    if confidence.shape[-2:] != target_size:
+        confidence = F.interpolate(confidence.unsqueeze(1), size=target_size,
+                                   mode='bilinear', align_corners=False).squeeze(1)
+
+    edge_grad = image_gradient_magnitude(ref_img, target_size)
+    w_conf = torch.sigmoid(k_conf * (confidence - conf_mid))
+    w_edge = torch.sigmoid(k_edge * (edge_mid - edge_grad))
+    geometry_weight = valid_weight * (w_min + (1.0 - w_min) * w_conf * w_edge)
+
+    valid_sum = valid_weight.sum() + 1e-6
+    metrics = {
+        "geometry_weight_mean": geometry_weight.mean().detach(),
+        "geometry_weight_valid_mean": (geometry_weight.sum() / valid_sum).detach(),
+        "high_weight_ratio": (geometry_weight > 0.7).float().mean().detach(),
+        "low_weight_ratio": (geometry_weight < 0.2).float().mean().detach(),
+    }
+    return geometry_weight, metrics
+
+
 def non_edge_depth_grad_mean(depth, smooth_mask):
     if depth.dim() == 4:
         depth = depth.squeeze(1)
@@ -660,6 +692,25 @@ def curvature_loss(depth, mask):
     return masked_mean(curv_x.abs(), mask_x) + masked_mean(curv_y.abs(), mask_y)
 
 
+def weighted_mean(value, weight):
+    return (value * weight).sum() / (weight.sum() + 1e-6)
+
+
+def soft_curvature_loss(depth, weight):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    if weight.dim() == 4:
+        weight = weight.squeeze(1)
+    weight = weight.float()
+    depth_mean = weighted_mean(depth, weight).detach()
+    depth_norm = depth / (depth_mean + 1e-6)
+    curv_x = depth_norm[:, :, 2:] - 2 * depth_norm[:, :, 1:-1] + depth_norm[:, :, :-2]
+    curv_y = depth_norm[:, 2:, :] - 2 * depth_norm[:, 1:-1, :] + depth_norm[:, :-2, :]
+    weight_x = torch.min(torch.min(weight[:, :, 2:], weight[:, :, 1:-1]), weight[:, :, :-2])
+    weight_y = torch.min(torch.min(weight[:, 2:, :], weight[:, 1:-1, :]), weight[:, :-2, :])
+    return weighted_mean(curv_x.abs(), weight_x) + weighted_mean(curv_y.abs(), weight_y)
+
+
 def edge_aware_smooth_loss(depth, ref_img, mask):
     ref_img = F.interpolate(ref_img, size=depth.shape[-2:], mode='bilinear', align_corners=False)
     depth_mean = masked_mean(depth, mask).detach()
@@ -685,11 +736,23 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     depth_normal_loss_weight = kwargs.get("depth_normal_loss_weight", 0.0)
     depth_normal_conf_threshold = kwargs.get("depth_normal_conf_threshold", 0.8)
     edge_grad_threshold = kwargs.get("edge_grad_threshold", 0.05)
+    geometry_conf_mid = kwargs.get("geometry_conf_mid", 0.65)
+    geometry_k_conf = kwargs.get("geometry_k_conf", 10.0)
+    geometry_edge_mid = kwargs.get("geometry_edge_mid", 0.25)
+    geometry_k_edge = kwargs.get("geometry_k_edge", 10.0)
+    geometry_w_min = kwargs.get("geometry_w_min", 0.05)
     return_extra = kwargs.get("return_extra", False)
 
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
     extra = {}
     depth_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    normal_smooth_loss_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    curvature_loss_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    edge_aware_smooth_loss_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    curvature_loss_raw_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    curvature_loss_weighted_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    geometry_metric_accum = {}
+    geometry_metric_count = 0
 
     stage_keys = [k for k in inputs.keys()
                   if k.startswith("stage") and k.replace("stage", "").isdigit()]
@@ -710,25 +773,46 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             total_loss += 1.0 * depth_loss
         #  if int(stage_key.replace("stage", "")) > 2:
         stage_idx = int(stage_key.replace("stage", "")) - 1
-        normal_smooth_loss_final = 0.0
-        curvature_loss_final = 0.0
-        edge_aware_smooth_loss_final = 0.0
         geometry_mask = None
+        geometry_weight = None
         if imgs is not None and "photometric_confidence" in stage_inputs:
             geometry_mask = build_smooth_mask(imgs[:, 0], mask, stage_inputs["photometric_confidence"],
                                               depth_normal_conf_threshold,
                                               edge_grad_threshold,
                                               depth_est.shape[-2:])
             extra["geometry_mask_ratio"] = geometry_mask.float().mean().detach()
+            geometry_weight, geometry_metrics = build_geometry_weight(
+                imgs[:, 0],
+                mask,
+                stage_inputs["photometric_confidence"],
+                depth_est.shape[-2:],
+                geometry_conf_mid,
+                geometry_k_conf,
+                geometry_edge_mid,
+                geometry_k_edge,
+                geometry_w_min)
+            geometry_metric_count += 1
+            for metric_key, metric_value in geometry_metrics.items():
+                extra["{}/{}".format(stage_key, metric_key)] = metric_value
+                if metric_key not in geometry_metric_accum:
+                    geometry_metric_accum[metric_key] = metric_value
+                else:
+                    geometry_metric_accum[metric_key] = geometry_metric_accum[metric_key] + metric_value
         if normal_smooth_loss_weight > 0:
             normal_smooth_loss_final = normal_smooth_loss(depth_est, mask)
             total_loss += (normal_smooth_loss_weight/pow(2, stage_idx)) * normal_smooth_loss_final
             extra["normal_smooth_loss"] = normal_smooth_loss_final.detach()
         if curv_loss_weight > 0:
-            curvature_mask = geometry_mask if geometry_mask is not None else mask
-            curvature_loss_final = curvature_loss(depth_est, curvature_mask)
-            total_loss += (curv_loss_weight/pow(2, stage_idx)) * curvature_loss_final
-            extra["curv_loss"] = curvature_loss_final.detach()
+            curvature_loss_raw = curvature_loss(depth_est, mask)
+            curvature_loss_weighted = soft_curvature_loss(depth_est, geometry_weight if geometry_weight is not None else mask.float())
+            curv_stage_weight = 0.5 * float(stage_idx + 1)
+            curvature_loss_final = curvature_loss_final + curv_stage_weight * curvature_loss_weighted
+            curvature_loss_raw_final = curvature_loss_raw_final + curv_stage_weight * curvature_loss_raw
+            curvature_loss_weighted_final = curvature_loss_weighted_final + curv_stage_weight * curvature_loss_weighted
+            total_loss += curv_loss_weight * curv_stage_weight * curvature_loss_weighted
+            extra["{}/curvature_loss_raw".format(stage_key)] = curvature_loss_raw.detach()
+            extra["{}/curvature_loss_weighted".format(stage_key)] = curvature_loss_weighted.detach()
+            extra["{}/curv_loss".format(stage_key)] = curvature_loss_weighted.detach()
         if edge_smooth_loss_weight > 0 and imgs is not None:
             edge_aware_smooth_loss_final = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
             total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
@@ -750,6 +834,14 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             extra["depth_normal_loss"] = loss_depth_normal.detach()
             extra.update(dn_metrics)
             extra["smooth_mask"] = smooth_mask.detach()
+
+    if geometry_metric_count > 0:
+        for metric_key, metric_value in geometry_metric_accum.items():
+            extra[metric_key] = (metric_value / geometry_metric_count).detach()
+    if curv_loss_weight > 0:
+        extra["curv_loss"] = curvature_loss_final.detach()
+        extra["curvature_loss_raw"] = curvature_loss_raw_final.detach()
+        extra["curvature_loss_weighted"] = curvature_loss_weighted_final.detach()
 
     if return_extra:
             return total_loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final, extra
