@@ -6,9 +6,11 @@ from models.module import (
     compute_normal_from_depth,
     build_smooth_mask,
     build_geometry_weight,
+    build_dual_region_geometry,
     non_edge_depth_grad_mean,
     curvature_loss,
     soft_curvature_loss,
+    dual_region_curvature_loss,
     depth_normal_consistency_loss,
     cas_mvsnet_loss,
 )
@@ -156,6 +158,41 @@ def test_build_geometry_weight_softly_downweights_low_confidence_and_edges():
     assert metrics["geometry_weight_valid_mean"].item() >= 0.05
     assert metrics["high_weight_ratio"].item() > 0.0
     assert metrics["low_weight_ratio"].item() > 0.0
+
+
+def test_build_dual_region_geometry_separates_hard_joint_and_soft_surface():
+    ref_img = torch.zeros(1, 3, 3, 7)
+    ref_img[:, :, :, 3:] = 1.0
+    valid_mask = torch.ones(1, 3, 7, dtype=torch.bool)
+    depth = torch.ones(1, 3, 7)
+    depth[:, :, 3:] = 2.0
+    depth[:, 1, 5] = 4.0
+    confidence = torch.ones(1, 1, 3, 7)
+    confidence[:, :, :, 0] = 0.1
+
+    region_a, weight_b, metrics = build_dual_region_geometry(
+        ref_img,
+        valid_mask,
+        depth,
+        confidence,
+        target_size=(3, 7),
+        threshold_edge=0.25,
+        threshold_depth=0.2,
+        threshold_curv=0.3,
+        conf_mid=0.65,
+        k_conf=10.0,
+        smooth_k=2.0,
+    )
+
+    assert region_a.dtype == torch.bool
+    assert weight_b.dtype == ref_img.dtype
+    assert region_a[:, :, 2].any()
+    assert region_a[:, :, 3].any()
+    assert region_a[:, 1, 5]
+    assert torch.all(weight_b[region_a] == 0.0)
+    assert weight_b[:, :, 0].max().item() < weight_b[:, :, 1].min().item()
+    assert metrics["region_A_ratio"].item() > 0.0
+    assert metrics["region_B_ratio"].item() > 0.0
 
 
 def test_non_edge_depth_grad_mean_accepts_4d_depth():
@@ -529,6 +566,32 @@ def test_soft_geometry_weight_does_not_backpropagate_through_confidence():
     assert confidence.grad is None
 
 
+def test_dual_region_curvature_loss_combines_hard_and_soft_regions():
+    depth = torch.tensor([[[1.0, 1.0, 4.0, 1.0, 2.0]]])
+    region_a = torch.tensor([[[False, True, True, True, False]]])
+    weight_b = torch.tensor([[[1.0, 0.0, 0.0, 0.0, 0.5]]])
+
+    total, loss_a, loss_b = dual_region_curvature_loss(
+        depth,
+        region_a,
+        weight_b,
+        lambda_a=1.5,
+        lambda_b=1.0,
+    )
+
+    depth_mean = depth.mean()
+    depth_norm = depth / depth_mean
+    curv_x = (depth_norm[:, :, 2:] - 2 * depth_norm[:, :, 1:-1] + depth_norm[:, :, :-2]).abs()
+    region_a_x = region_a[:, :, 2:] & region_a[:, :, 1:-1] & region_a[:, :, :-2]
+    weight_b_x = torch.min(torch.min(weight_b[:, :, 2:], weight_b[:, :, 1:-1]), weight_b[:, :, :-2])
+    expected_a = (curv_x * region_a_x.float()).sum() / (region_a_x.float().sum() + 1e-6)
+    expected_b = (curv_x * weight_b_x).sum() / (weight_b_x.sum() + 1e-6)
+
+    assert torch.allclose(loss_a, expected_a)
+    assert torch.allclose(loss_b, expected_b)
+    assert torch.allclose(total, 1.5 * expected_a + expected_b)
+
+
 def test_cas_mvsnet_loss_depth_normal_branch_backpropagates_to_depth_and_normal():
     torch.manual_seed(5)
     depth = 1.0 + torch.rand(1, 4, 5)
@@ -688,3 +751,53 @@ def test_cas_mvsnet_loss_uses_requested_multistage_curvature_weights():
     assert torch.allclose(extra["curvature_loss_weighted"], expected)
     assert torch.allclose(extra["curv_loss"], expected)
     assert torch.allclose(total_loss, expected)
+
+
+def test_cas_mvsnet_loss_uses_dual_region_curvature_when_enabled():
+    stage_depths = {
+        "stage1": torch.tensor([[[1.0, 1.0, 3.0, 1.0, 1.0]]]),
+        "stage2": torch.tensor([[[1.0, 1.0, 4.0, 1.0, 1.0]]]),
+        "stage3": torch.tensor([[[1.0, 1.0, 5.0, 1.0, 1.0]]]),
+    }
+    inputs = {
+        stage_key: {
+            "depth": depth,
+            "photometric_confidence": torch.ones_like(depth),
+        }
+        for stage_key, depth in stage_depths.items()
+    }
+    depth_gt_ms = {stage_key: torch.ones_like(depth) for stage_key, depth in stage_depths.items()}
+    mask_ms = {stage_key: torch.ones_like(depth) for stage_key, depth in stage_depths.items()}
+    imgs = torch.zeros(1, 1, 3, 1, 5)
+    imgs[:, :, :, :, 2:] = 1.0
+
+    total_loss, _, extra = _unpack_loss_result(cas_mvsnet_loss(
+        inputs,
+        depth_gt_ms,
+        mask_ms,
+        imgs=imgs,
+        dlossw=[0.0, 0.0, 0.0],
+        curv_loss_weight=1.0,
+        use_dual_region_curvature=True,
+        region_lambda_a=1.5,
+        region_lambda_b=1.0,
+        region_edge_threshold=0.25,
+        region_depth_threshold=0.2,
+        region_curv_threshold=0.2,
+        return_extra=True,
+    ))
+
+    expected = (
+        0.5 * extra["stage1/curv_loss_total"]
+        + 1.0 * extra["stage2/curv_loss_total"]
+        + 1.5 * extra["stage3/curv_loss_total"]
+    )
+    assert torch.allclose(extra["curv_loss_total"], expected)
+    assert torch.allclose(extra["curv_loss"], expected)
+    assert torch.allclose(total_loss, expected)
+    assert extra["curv_loss_A"].item() > 0.0
+    assert extra["curv_loss_B"].item() >= 0.0
+    assert extra["region_A_ratio"].item() > 0.0
+    assert extra["region_B_ratio"].item() > 0.0
+    assert "acc_region_A" in extra
+    assert "acc_region_B" in extra

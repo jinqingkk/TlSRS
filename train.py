@@ -60,6 +60,14 @@ parser.add_argument('--geometry_k_conf', type=float, default=10.0, help='confide
 parser.add_argument('--geometry_edge_mid', type=float, default=0.25, help='image gradient midpoint for soft geometry weight')
 parser.add_argument('--geometry_k_edge', type=float, default=10.0, help='edge sigmoid slope for soft geometry weight')
 parser.add_argument('--geometry_w_min', type=float, default=0.05, help='minimum soft geometry weight on valid depth')
+parser.add_argument('--use_dual_region_curvature', action='store_true', default=True, help='use Test9 hard/soft dual-region curvature constraint')
+parser.add_argument('--disable_dual_region_curvature', dest='use_dual_region_curvature', action='store_false', help='fall back to Test8 soft geometry curvature constraint')
+parser.add_argument('--region_lambda_a', type=float, default=1.5, help='hard Region A curvature loss weight')
+parser.add_argument('--region_lambda_b', type=float, default=1.0, help='soft Region B curvature loss weight')
+parser.add_argument('--region_edge_threshold', type=float, default=0.25, help='Sobel image edge threshold for Region A')
+parser.add_argument('--region_depth_threshold', type=float, default=0.02, help='normalized depth gradient threshold for Region A')
+parser.add_argument('--region_curv_threshold', type=float, default=0.02, help='normalized high curvature threshold for Region A')
+parser.add_argument('--region_smooth_k', type=float, default=2.0, help='image-gradient decay slope for Region B soft weight')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 
@@ -90,6 +98,13 @@ def loss_kwargs(sample_cuda, args):
         "geometry_edge_mid": args.geometry_edge_mid,
         "geometry_k_edge": args.geometry_k_edge,
         "geometry_w_min": args.geometry_w_min,
+        "use_dual_region_curvature": args.use_dual_region_curvature,
+        "region_lambda_a": args.region_lambda_a,
+        "region_lambda_b": args.region_lambda_b,
+        "region_edge_threshold": args.region_edge_threshold,
+        "region_depth_threshold": args.region_depth_threshold,
+        "region_curv_threshold": args.region_curv_threshold,
+        "region_smooth_k": args.region_smooth_k,
         "return_extra": True,
     }
 

@@ -574,6 +574,58 @@ def image_gradient_magnitude(ref_img, target_size):
     return grad
 
 
+def sobel_gradient_magnitude(ref_img, target_size):
+    ref_img = F.interpolate(ref_img, size=target_size, mode='bilinear', align_corners=False)
+    gray = ref_img.mean(dim=1, keepdim=True)
+    kernel_x = gray.new_tensor([[-1.0, 0.0, 1.0],
+                                [-2.0, 0.0, 2.0],
+                                [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3)
+    kernel_y = gray.new_tensor([[-1.0, -2.0, -1.0],
+                                [0.0, 0.0, 0.0],
+                                [1.0, 2.0, 1.0]]).view(1, 1, 3, 3)
+    grad_x = F.conv2d(gray, kernel_x, padding=1)
+    grad_y = F.conv2d(gray, kernel_y, padding=1)
+    return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-12).squeeze(1)
+
+
+def depth_gradient_magnitude(depth, valid_mask):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    valid_mask = valid_mask > 0.5
+    depth_mean = masked_mean(depth, valid_mask).detach()
+    depth_norm = depth / (depth_mean + 1e-6)
+    grad = depth.new_zeros(depth.shape)
+    depth_dx = gradient_x(depth_norm).abs()
+    depth_dy = gradient_y(depth_norm).abs()
+    if depth_dx.numel() > 0:
+        grad[:, :, 1:] = torch.max(grad[:, :, 1:], depth_dx)
+        grad[:, :, :-1] = torch.max(grad[:, :, :-1], depth_dx)
+    if depth_dy.numel() > 0:
+        grad[:, 1:, :] = torch.max(grad[:, 1:, :], depth_dy)
+        grad[:, :-1, :] = torch.max(grad[:, :-1, :], depth_dy)
+    return grad
+
+
+def curvature_magnitude(depth, valid_mask):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    valid_mask = valid_mask > 0.5
+    depth_mean = masked_mean(depth, valid_mask).detach()
+    depth_norm = depth / (depth_mean + 1e-6)
+    curv = depth.new_zeros(depth.shape)
+    if depth.size(2) >= 3:
+        curv_x = (depth_norm[:, :, 2:] - 2 * depth_norm[:, :, 1:-1] + depth_norm[:, :, :-2]).abs()
+        curv[:, :, 1:-1] = torch.max(curv[:, :, 1:-1], curv_x)
+    if depth.size(1) >= 3:
+        curv_y = (depth_norm[:, 2:, :] - 2 * depth_norm[:, 1:-1, :] + depth_norm[:, :-2, :]).abs()
+        curv[:, 1:-1, :] = torch.max(curv[:, 1:-1, :], curv_y)
+    return curv
+
+
 def build_smooth_mask(ref_img, valid_mask, confidence, depth_normal_conf_threshold,
                       edge_grad_threshold, target_size):
     if valid_mask.dim() == 4:
@@ -623,6 +675,53 @@ def build_geometry_weight(ref_img, valid_mask, confidence, target_size,
         "low_weight_ratio": (geometry_weight < 0.2).float().mean().detach(),
     }
     return geometry_weight, metrics
+
+
+def build_dual_region_geometry(ref_img, valid_mask, depth, confidence, target_size,
+                               threshold_edge=0.25, threshold_depth=0.02,
+                               threshold_curv=0.02, conf_mid=0.65,
+                               k_conf=10.0, smooth_k=2.0):
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    if valid_mask.shape[-2:] != target_size:
+        valid_mask = F.interpolate(valid_mask.float().unsqueeze(1), size=target_size,
+                                   mode='nearest').squeeze(1)
+    valid_mask = valid_mask > 0.5
+
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    if depth.shape[-2:] != target_size:
+        depth = F.interpolate(depth.unsqueeze(1), size=target_size,
+                              mode='bilinear', align_corners=False).squeeze(1)
+    depth_for_mask = depth.detach()
+
+    if confidence.dim() == 4:
+        confidence = confidence.squeeze(1)
+    confidence = confidence.detach()
+    if confidence.shape[-2:] != target_size:
+        confidence = F.interpolate(confidence.unsqueeze(1), size=target_size,
+                                   mode='bilinear', align_corners=False).squeeze(1)
+
+    edge_map = sobel_gradient_magnitude(ref_img, target_size)
+    depth_grad = depth_gradient_magnitude(depth_for_mask, valid_mask)
+    curv_map = curvature_magnitude(depth_for_mask, valid_mask)
+
+    edge_mask = edge_map > threshold_edge
+    depth_edge_mask = depth_grad > threshold_depth
+    joint_mask = edge_mask & depth_edge_mask
+    high_curv_mask = curv_map > threshold_curv
+    region_a = valid_mask & (joint_mask | high_curv_mask)
+    region_b = valid_mask & (~region_a)
+
+    confidence_weight = torch.sigmoid(k_conf * (confidence - conf_mid))
+    smooth_weight = torch.exp(-smooth_k * edge_map)
+    weight_b = region_b.float() * confidence_weight * smooth_weight
+
+    metrics = {
+        "region_A_ratio": region_a.float().mean().detach(),
+        "region_B_ratio": region_b.float().mean().detach(),
+    }
+    return region_a, weight_b, metrics
 
 
 def non_edge_depth_grad_mean(depth, smooth_mask):
@@ -711,6 +810,29 @@ def soft_curvature_loss(depth, weight):
     return weighted_mean(curv_x.abs(), weight_x) + weighted_mean(curv_y.abs(), weight_y)
 
 
+def dual_region_curvature_loss(depth, region_a, weight_b, lambda_a=1.5, lambda_b=1.0):
+    if depth.dim() == 4:
+        depth = depth.squeeze(1)
+    if region_a.dim() == 4:
+        region_a = region_a.squeeze(1)
+    if weight_b.dim() == 4:
+        weight_b = weight_b.squeeze(1)
+    region_a = region_a > 0.5
+    weight_b = weight_b.float()
+    valid_support = (region_a | (weight_b > 0.0)).float()
+    depth_mean = weighted_mean(depth, valid_support).detach()
+    depth_norm = depth / (depth_mean + 1e-6)
+    curv_x = depth_norm[:, :, 2:] - 2 * depth_norm[:, :, 1:-1] + depth_norm[:, :, :-2]
+    curv_y = depth_norm[:, 2:, :] - 2 * depth_norm[:, 1:-1, :] + depth_norm[:, :-2, :]
+    region_a_x = region_a[:, :, 2:] & region_a[:, :, 1:-1] & region_a[:, :, :-2]
+    region_a_y = region_a[:, 2:, :] & region_a[:, 1:-1, :] & region_a[:, :-2, :]
+    weight_b_x = torch.min(torch.min(weight_b[:, :, 2:], weight_b[:, :, 1:-1]), weight_b[:, :, :-2])
+    weight_b_y = torch.min(torch.min(weight_b[:, 2:, :], weight_b[:, 1:-1, :]), weight_b[:, :-2, :])
+    loss_a = masked_mean(curv_x.abs(), region_a_x) + masked_mean(curv_y.abs(), region_a_y)
+    loss_b = weighted_mean(curv_x.abs(), weight_b_x) + weighted_mean(curv_y.abs(), weight_b_y)
+    return lambda_a * loss_a + lambda_b * loss_b, loss_a, loss_b
+
+
 def edge_aware_smooth_loss(depth, ref_img, mask):
     ref_img = F.interpolate(ref_img, size=depth.shape[-2:], mode='bilinear', align_corners=False)
     depth_mean = masked_mean(depth, mask).detach()
@@ -741,6 +863,13 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     geometry_edge_mid = kwargs.get("geometry_edge_mid", 0.25)
     geometry_k_edge = kwargs.get("geometry_k_edge", 10.0)
     geometry_w_min = kwargs.get("geometry_w_min", 0.05)
+    use_dual_region_curvature = kwargs.get("use_dual_region_curvature", False)
+    region_lambda_a = kwargs.get("region_lambda_a", 1.5)
+    region_lambda_b = kwargs.get("region_lambda_b", 1.0)
+    region_edge_threshold = kwargs.get("region_edge_threshold", 0.25)
+    region_depth_threshold = kwargs.get("region_depth_threshold", 0.02)
+    region_curv_threshold = kwargs.get("region_curv_threshold", 0.02)
+    region_smooth_k = kwargs.get("region_smooth_k", 2.0)
     return_extra = kwargs.get("return_extra", False)
 
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
@@ -753,6 +882,11 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     curvature_loss_weighted_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
     geometry_metric_accum = {}
     geometry_metric_count = 0
+    region_metric_accum = {}
+    region_metric_count = 0
+    curv_loss_a_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    curv_loss_b_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+    curv_loss_total_final = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
 
     stage_keys = [k for k in inputs.keys()
                   if k.startswith("stage") and k.replace("stage", "").isdigit()]
@@ -803,16 +937,55 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             total_loss += (normal_smooth_loss_weight/pow(2, stage_idx)) * normal_smooth_loss_final
             extra["normal_smooth_loss"] = normal_smooth_loss_final.detach()
         if curv_loss_weight > 0:
-            curvature_loss_raw = curvature_loss(depth_est, mask)
-            curvature_loss_weighted = soft_curvature_loss(depth_est, geometry_weight if geometry_weight is not None else mask.float())
             curv_stage_weight = 0.5 * float(stage_idx + 1)
-            curvature_loss_final = curvature_loss_final + curv_stage_weight * curvature_loss_weighted
-            curvature_loss_raw_final = curvature_loss_raw_final + curv_stage_weight * curvature_loss_raw
-            curvature_loss_weighted_final = curvature_loss_weighted_final + curv_stage_weight * curvature_loss_weighted
-            total_loss += curv_loss_weight * curv_stage_weight * curvature_loss_weighted
-            extra["{}/curvature_loss_raw".format(stage_key)] = curvature_loss_raw.detach()
-            extra["{}/curvature_loss_weighted".format(stage_key)] = curvature_loss_weighted.detach()
-            extra["{}/curv_loss".format(stage_key)] = curvature_loss_weighted.detach()
+            if use_dual_region_curvature and imgs is not None and "photometric_confidence" in stage_inputs:
+                region_a, weight_b, region_metrics = build_dual_region_geometry(
+                    imgs[:, 0],
+                    mask,
+                    depth_est,
+                    stage_inputs["photometric_confidence"],
+                    depth_est.shape[-2:],
+                    region_edge_threshold,
+                    region_depth_threshold,
+                    region_curv_threshold,
+                    geometry_conf_mid,
+                    geometry_k_conf,
+                    region_smooth_k)
+                curv_loss_total, curv_loss_a, curv_loss_b = dual_region_curvature_loss(
+                    depth_est, region_a, weight_b, region_lambda_a, region_lambda_b)
+                region_b = mask & (~region_a)
+                acc_a = masked_mean((depth_est - depth_gt).abs().detach(), region_a)
+                acc_b = masked_mean((depth_est - depth_gt).abs().detach(), region_b)
+                total_loss += curv_loss_weight * curv_stage_weight * curv_loss_total
+                curvature_loss_final = curvature_loss_final + curv_stage_weight * curv_loss_total
+                curv_loss_a_final = curv_loss_a_final + curv_stage_weight * curv_loss_a
+                curv_loss_b_final = curv_loss_b_final + curv_stage_weight * curv_loss_b
+                curv_loss_total_final = curv_loss_total_final + curv_stage_weight * curv_loss_total
+                stage_region_metrics = {
+                    "curv_loss_A": curv_loss_a.detach(),
+                    "curv_loss_B": curv_loss_b.detach(),
+                    "curv_loss_total": curv_loss_total.detach(),
+                    "acc_region_A": acc_a.detach(),
+                    "acc_region_B": acc_b.detach(),
+                }
+                stage_region_metrics.update(region_metrics)
+                region_metric_count += 1
+                for metric_key, metric_value in stage_region_metrics.items():
+                    extra["{}/{}".format(stage_key, metric_key)] = metric_value
+                    if metric_key not in region_metric_accum:
+                        region_metric_accum[metric_key] = metric_value
+                    else:
+                        region_metric_accum[metric_key] = region_metric_accum[metric_key] + metric_value
+            else:
+                curvature_loss_raw = curvature_loss(depth_est, mask)
+                curvature_loss_weighted = soft_curvature_loss(depth_est, geometry_weight if geometry_weight is not None else mask.float())
+                curvature_loss_final = curvature_loss_final + curv_stage_weight * curvature_loss_weighted
+                curvature_loss_raw_final = curvature_loss_raw_final + curv_stage_weight * curvature_loss_raw
+                curvature_loss_weighted_final = curvature_loss_weighted_final + curv_stage_weight * curvature_loss_weighted
+                total_loss += curv_loss_weight * curv_stage_weight * curvature_loss_weighted
+                extra["{}/curvature_loss_raw".format(stage_key)] = curvature_loss_raw.detach()
+                extra["{}/curvature_loss_weighted".format(stage_key)] = curvature_loss_weighted.detach()
+                extra["{}/curv_loss".format(stage_key)] = curvature_loss_weighted.detach()
         if edge_smooth_loss_weight > 0 and imgs is not None:
             edge_aware_smooth_loss_final = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
             total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
@@ -840,8 +1013,17 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             extra[metric_key] = (metric_value / geometry_metric_count).detach()
     if curv_loss_weight > 0:
         extra["curv_loss"] = curvature_loss_final.detach()
-        extra["curvature_loss_raw"] = curvature_loss_raw_final.detach()
-        extra["curvature_loss_weighted"] = curvature_loss_weighted_final.detach()
+        if use_dual_region_curvature and region_metric_count > 0:
+            for metric_key, metric_value in region_metric_accum.items():
+                if metric_key in ("curv_loss_A", "curv_loss_B", "curv_loss_total"):
+                    continue
+                extra[metric_key] = (metric_value / region_metric_count).detach()
+            extra["curv_loss_A"] = curv_loss_a_final.detach()
+            extra["curv_loss_B"] = curv_loss_b_final.detach()
+            extra["curv_loss_total"] = curv_loss_total_final.detach()
+        else:
+            extra["curvature_loss_raw"] = curvature_loss_raw_final.detach()
+            extra["curvature_loss_weighted"] = curvature_loss_weighted_final.detach()
 
     if return_extra:
             return total_loss, depth_loss, normal_smooth_loss_final, curvature_loss_final, edge_aware_smooth_loss_final, extra
