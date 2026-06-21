@@ -136,11 +136,26 @@ def compute_metrics_for_each_image(metric_func):
     return wrapper
 
 
+def masked_select_metric_inputs(depth_est, depth_gt, mask):
+    mask = mask.bool().contiguous()
+    depth_est = depth_est.contiguous()
+    depth_gt = depth_gt.contiguous()
+    assert depth_est.shape == depth_gt.shape == mask.shape, \
+        "metric shape mismatch: depth_est {}, depth_gt {}, mask {}".format(
+            depth_est.shape, depth_gt.shape, mask.shape)
+    if mask.sum() == 0:
+        empty = depth_est.new_empty((0,))
+        return empty, empty
+    return torch.masked_select(depth_est, mask), torch.masked_select(depth_gt, mask)
+
+
 @make_nograd_func
 @compute_metrics_for_each_image
 def Thres_metrics(depth_est, depth_gt, mask, thres):
     assert isinstance(thres, (int, float))
-    depth_est, depth_gt = depth_est[mask], depth_gt[mask]
+    depth_est, depth_gt = masked_select_metric_inputs(depth_est, depth_gt, mask)
+    if depth_est.numel() == 0:
+        return torch.tensor(0, device=depth_gt.device, dtype=depth_gt.dtype)
     errors = torch.abs(depth_est - depth_gt)
     err_mask = errors > thres
     return torch.mean(err_mask.float())
@@ -150,7 +165,9 @@ def Thres_metrics(depth_est, depth_gt, mask, thres):
 @make_nograd_func
 @compute_metrics_for_each_image
 def AbsDepthError_metrics(depth_est, depth_gt, mask, thres=None):
-    depth_est, depth_gt = depth_est[mask], depth_gt[mask]
+    depth_est, depth_gt = masked_select_metric_inputs(depth_est, depth_gt, mask)
+    if depth_est.numel() == 0:
+        return torch.tensor(0, device=depth_gt.device, dtype=depth_gt.dtype)
     error = (depth_est - depth_gt).abs()
     if thres is not None:
         error = error[(error >= float(thres[0])) & (error <= float(thres[1]))]
