@@ -11,7 +11,8 @@ from models import *
 from utils import *
 import torch.distributed as dist
 
-cudnn.benchmark = True
+cudnn.benchmark = False
+cudnn.deterministic = True
 
 parser = argparse.ArgumentParser(description='A PyTorch Implementation of Cascade Cost Volume MVSNet')
 parser.add_argument('--mode', default='train', help='train or test', choices=['train', 'test', 'profile'])
