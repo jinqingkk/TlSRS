@@ -3,3 +3,7 @@
 /checkpoints/
 /outputs/
 /.worktrees/
+/docs/superpowers/
+/codex_results/
+/.superpowers/brainstorm/
+/SGER_CasMVSNet_code_modification_guide.md
