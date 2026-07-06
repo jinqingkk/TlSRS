@@ -71,6 +71,17 @@ parser.add_argument('--region_curv_threshold', type=float, default=0.02, help='n
 parser.add_argument('--region_smooth_k', type=float, default=2.0, help='image-gradient decay slope for Region B soft weight')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
+parser.add_argument('--use_sger', action='store_true', help='enable per-stage SGER depth refinement')
+parser.add_argument('--sger_share', action='store_true', help='share the SGER core across stages')
+parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
+parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
+parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=2.0, help='maximum residual in stage depth intervals')
+parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
+parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
+parser.add_argument('--raw_depth_loss_weight', type=float, default=0.5, help='auxiliary raw stage depth loss weight')
+parser.add_argument('--refined_depth_loss_weight', type=float, default=1.0, help='refined stage depth loss weight')
+parser.add_argument('--residual_loss_weight', type=float, default=0.001, help='normalized SGER residual regularization weight')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -88,6 +99,9 @@ def loss_kwargs(sample_cuda, args):
         "imgs": sample_cuda["imgs"],
         "proj_matrices": sample_cuda["proj_matrices"],
         "dlossw": [float(e) for e in args.dlossw.split(",") if e],
+        "raw_depth_loss_weight": args.raw_depth_loss_weight,
+        "refined_depth_loss_weight": args.refined_depth_loss_weight,
+        "residual_loss_weight": args.residual_loss_weight,
         "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
         "curv_loss_weight": args.curv_loss_weight,
         "edge_smooth_loss_weight": args.edge_smooth_loss_weight,
@@ -108,6 +122,25 @@ def loss_kwargs(sample_cuda, args):
         "region_smooth_k": args.region_smooth_k,
         "return_extra": True,
     }
+
+
+def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger):
+    if not use_sger:
+        return
+    allowed_missing_prefixes = (
+        "sger_blocks.",
+        "shared_sger.",
+        "sger_feature_adapters.",
+    )
+    invalid_missing = [
+        key for key in missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if invalid_missing or unexpected_keys:
+        raise RuntimeError(
+            "checkpoint is incompatible with SGER initialization; "
+            "unrelated missing keys: {}; unexpected keys: {}".format(
+                invalid_missing, list(unexpected_keys)))
 
 
 # main function
@@ -239,6 +272,14 @@ def train_sample(model, model_loss, optimizer, sample, args):
                      }
     if "normal" in outputs:
         image_outputs["normal_pred"] = (outputs["normal"] + 1.0) * 0.5
+    if "depth_raw" in outputs:
+        image_outputs["depth_raw"] = outputs["depth_raw"] * mask
+    if "depth_residual" in outputs:
+        image_outputs["depth_residual"] = outputs["depth_residual"]
+    if "geometry_gate" in outputs:
+        image_outputs["geometry_gate"] = outputs["geometry_gate"]
+    if "region_a" in outputs:
+        image_outputs["region_a"] = outputs["region_a"].float()
     if "smooth_mask" in loss_extra:
         image_outputs["smooth_mask"] = loss_extra["smooth_mask"].unsqueeze(1).float()
 
@@ -295,6 +336,14 @@ def test_sample_depth(model, model_loss, sample, args):
                      "errormap": (depth_est - depth_gt).abs() * mask}
     if "normal" in outputs:
         image_outputs["normal_pred"] = (outputs["normal"] + 1.0) * 0.5
+    if "depth_raw" in outputs:
+        image_outputs["depth_raw"] = outputs["depth_raw"] * mask
+    if "depth_residual" in outputs:
+        image_outputs["depth_residual"] = outputs["depth_residual"]
+    if "geometry_gate" in outputs:
+        image_outputs["geometry_gate"] = outputs["geometry_gate"]
+    if "region_a" in outputs:
+        image_outputs["region_a"] = outputs["region_a"].float()
     if "smooth_mask" in loss_extra:
         image_outputs["smooth_mask"] = loss_extra["smooth_mask"].unsqueeze(1).float()
 
@@ -383,7 +432,22 @@ if __name__ == '__main__':
                           depth_interals_ratio=[float(d_i) for d_i in args.depth_inter_r.split(",") if d_i],
                           share_cr=args.share_cr,
                           cr_base_chs=[int(ch) for ch in args.cr_base_chs.split(",") if ch],
-                          grad_method=args.grad_method)
+                          grad_method=args.grad_method,
+                          use_sger=args.use_sger,
+                          sger_share=args.sger_share,
+                          sger_feature_channels=args.sger_feature_channels,
+                          sger_hidden_channels=args.sger_hidden_channels,
+                          sger_gate_channels=args.sger_gate_channels,
+                          sger_max_residual_ratio=args.sger_max_residual_ratio,
+                          detach_refined_feedback=args.detach_refined_feedback,
+                          sger_gate_kwargs={
+                              "threshold_edge": args.region_edge_threshold,
+                              "threshold_depth": args.region_depth_threshold,
+                              "threshold_curv": args.region_curv_threshold,
+                              "conf_mid": args.geometry_conf_mid,
+                              "k_conf": args.geometry_k_conf,
+                              "smooth_k": args.region_smooth_k,
+                          })
     model.to(device)
     model_loss = cas_mvsnet_loss
 
@@ -411,6 +475,7 @@ if __name__ == '__main__':
         print("loading model {}".format(args.loadckpt))
         state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
         missing_keys, unexpected_keys = model.load_state_dict(state_dict['model'], strict=False)
+        validate_checkpoint_keys(missing_keys, unexpected_keys, args.use_sger)
         if missing_keys:
             print("missing keys when loading checkpoint:", missing_keys)
         if unexpected_keys:

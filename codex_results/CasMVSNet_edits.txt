@@ -1,0 +1,53 @@
+当前这份代码在原 CasMVSNet 的基础上，核心深度估计流程基本没改：仍然是 FeatureNet -> 多阶段 depth range sampling -> DepthNet 构建方差 cost volume -> CostRegNet -> softmax depth
+  regression。主要改动集中在“法线分支”和“训练损失约束”。
+
+  主要改动
+
+  1. 增加了逐阶段法线预测头
+     在 models/cas_mvsnet.py:108 里新增了 self.normal_head，每个 cascade stage 一个 NormalHead。
+     每个 stage 的输入是：
+
+     ref_feature + depth + photometric_confidence
+
+     然后输出 outputs_stage["normal"]，并且顶层 outputs["normal"] 会被最新 stage 覆盖，默认就是 stage3 法线图。相关 forward 逻辑在 models/cas_mvsnet.py:159。
+
+  2. 新增 NormalHead 模块
+     NormalHead 是一个轻量 2D CNN：两层 Conv2d 加一层输出 3 通道法线的卷积，最后 F.normalize 归一化为单位法线。位置在 models/module.py:502。
+
+  3. 增加由深度反算法线的几何工具
+     新增了从预测深度和相机内参计算几何法线的函数 compute_normal_from_depth()，用于和网络预测法线做一致性约束。位置在 models/module.py:542。
+
+  4. 训练损失从原来的多阶段深度 Smooth L1 扩展为多项几何正则
+     原始 module1.py 里的 cas_mvsnet_loss 基本只做各 stage 的深度 Smooth L1。当前 active 的 models/module.py:851 增加了：
+      - normal_smooth_loss：根据深度梯度构造法线，约束邻域法线平滑。
+      - curvature_loss / soft_curvature_loss：二阶深度曲率连续性约束。
+      - edge_aware_smooth_loss：用参考图像梯度降低边缘处的平滑惩罚。
+      - depth_normal_consistency_loss：预测法线和由深度+内参反算出的法线保持一致。
+      - geometry_weight：用置信度和图像边缘构造软权重。
+      - dual_region_curvature_loss：把区域分成 hard Region A 和 soft Region B，分别加曲率约束。
+
+  5. 损失只在更可靠区域强约束
+     当前代码通过 photometric_confidence、有效深度 mask、图像非边缘区域来构造 smooth_mask。也就是不是全图强行平滑，而是在高置信、非边缘、有效区域更强地约束几何一致性。相关逻辑在
+     models/module.py:629 和 models/module.py:748。
+
+  6. 训练参数增加了多组几何损失开关和权重
+     train.py:53 新增了这些默认启用/可调参数：
+      - --normal_smooth_loss_weight 默认 0.02
+      - --curv_loss_weight 默认 0.005
+      - --edge_smooth_loss_weight 默认 0.005
+      - --depth_normal_loss_weight 默认 0.03
+      - --depth_normal_conf_threshold 默认 0.8
+      - --edge_grad_threshold 默认 0.05
+      - --use_dual_region_curvature 默认启用
+      - Region A/B 相关阈值和权重参数
+
+  总结一下：这不是把 CasMVSNet 的主干重写了，而是在原 cascade depth pipeline 上加了一个多阶段 normal branch，并把训练目标从“只监督深度”扩展成“深度 + 法线一致性 + 曲率连续 + 边缘感知平
+  滑 + 置信度/区域加权几何约束”。
+
+本文提出一种面向装配式衬砌混凝土大型单个管片高精度重建的自几何约束与边缘感知级联多视图立体网络，命名为 SGEA-CasMVSNet（Self-Geometric and Edge-Aware Cascade MVSNet）
+SGEA-CasMVSNet
+  全称：Self-Geometric and Edge-Aware Cascade MVSNet
+  中文：自几何约束与边缘感知级联多视图立体网络
+  - SG：Self-Geometric，自几何约束，包括深度-法线一致性、曲率连续性、几何置信区域约束。
+  - EA：Edge-Aware，边缘感知，包括图像边缘引导的平滑约束和非边缘区域几何约束。
+  - CasMVSNet：保留原始网络基础，说明是在 CasMVSNet 上改进。

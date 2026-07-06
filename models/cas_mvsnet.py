@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .module import *
+from .sger_refinement import SGERBlock
 
 Align_Corners_Range = False
 
@@ -68,7 +69,10 @@ class DepthNet(nn.Module):
 
 class CascadeMVSNet(nn.Module):
     def __init__(self, refine=False, ndepths=[48, 32, 8], depth_interals_ratio=[4, 2, 1], share_cr=False,
-                 grad_method="detach", arch_mode="fpn", cr_base_chs=[8, 8, 8]):
+                 grad_method="detach", arch_mode="fpn", cr_base_chs=[8, 8, 8], use_sger=False,
+                 sger_share=False, sger_feature_channels=8, sger_hidden_channels=32,
+                 sger_gate_channels=16, sger_max_residual_ratio=2.0,
+                 detach_refined_feedback=True, sger_gate_kwargs=None):
         super(CascadeMVSNet, self).__init__()
         self.refine = refine
         self.share_cr = share_cr
@@ -77,6 +81,10 @@ class CascadeMVSNet(nn.Module):
         self.grad_method = grad_method
         self.arch_mode = arch_mode
         self.cr_base_chs = cr_base_chs
+        self.use_sger = use_sger
+        self.sger_share = sger_share
+        self.detach_refined_feedback = detach_refined_feedback
+        self.sger_gate_kwargs = sger_gate_kwargs or {}
         self.num_stage = len(ndepths)
         print("**********netphs:{}, depth_intervals_ratio:{},  grad:{}, chs:{}************".format(ndepths,
               depth_interals_ratio, self.grad_method, self.cr_base_chs))
@@ -108,6 +116,30 @@ class CascadeMVSNet(nn.Module):
         self.normal_head = nn.ModuleList([
             NormalHead(out_channels + 2) for out_channels in self.feature.out_channels[:self.num_stage]
         ])
+        if self.use_sger:
+            if self.sger_share:
+                self.sger_feature_adapters = nn.ModuleList([
+                    nn.Conv2d(out_channels, sger_feature_channels, 1, bias=False)
+                    for out_channels in self.feature.out_channels[:self.num_stage]
+                ])
+                self.shared_sger = SGERBlock(
+                    feature_channels=sger_feature_channels,
+                    projected_feature_channels=sger_feature_channels,
+                    hidden_channels=sger_hidden_channels,
+                    gate_channels=sger_gate_channels,
+                    max_residual_ratio=sger_max_residual_ratio,
+                    **self.sger_gate_kwargs)
+            else:
+                self.sger_blocks = nn.ModuleList([
+                    SGERBlock(
+                        feature_channels=out_channels,
+                        projected_feature_channels=sger_feature_channels,
+                        hidden_channels=sger_hidden_channels,
+                        gate_channels=sger_gate_channels,
+                        max_residual_ratio=sger_max_residual_ratio,
+                        **self.sger_gate_kwargs)
+                    for out_channels in self.feature.out_channels[:self.num_stage]
+                ])
 
     def forward(self, imgs, proj_matrices, depth_values):
         depth_min = float(depth_values[0, 0].cpu().numpy())
@@ -131,7 +163,9 @@ class CascadeMVSNet(nn.Module):
             stage_scale = self.stage_infos[stage_key]["scale"]
 
             if depth is not None:
-                if self.grad_method == "detach":
+                if self.use_sger and self.detach_refined_feedback:
+                    cur_depth = depth.detach()
+                elif (not self.use_sger) and self.grad_method == "detach":
                     cur_depth = depth.detach()
                 else:
                     cur_depth = depth
@@ -170,6 +204,36 @@ class CascadeMVSNet(nn.Module):
                                                  align_corners=Align_Corners_Range)
             normal_input = torch.cat([ref_feature, depth_input, confidence_input], dim=1)
             outputs_stage["normal"] = self.normal_head[stage_idx](normal_input)
+
+            depth_raw = outputs_stage["depth"]
+            if self.use_sger:
+                ref_img_stage = F.interpolate(
+                    imgs[:, 0], size=depth_raw.shape[-2:],
+                    mode='bilinear', align_corners=Align_Corners_Range)
+                intrinsics_stage = proj_matrices_stage[:, 0, 1, :3, :3]
+                if self.sger_share:
+                    sger_feature = self.sger_feature_adapters[stage_idx](ref_feature)
+                    sger_block = self.shared_sger
+                else:
+                    sger_feature = ref_feature
+                    sger_block = self.sger_blocks[stage_idx]
+                sger_outputs = sger_block(
+                    depth_raw,
+                    outputs_stage["normal"],
+                    outputs_stage["photometric_confidence"],
+                    ref_img_stage,
+                    intrinsics_stage,
+                    sger_feature,
+                    depth_interval=self.depth_interals_ratio[stage_idx] * depth_interval)
+                outputs_stage["depth_raw"] = depth_raw
+                outputs_stage["depth_refined"] = sger_outputs["depth_refined"]
+                outputs_stage["depth"] = sger_outputs["depth_refined"]
+                for key in ("depth_residual", "residual_ratio", "geometry_gate",
+                            "region_a", "region_b_weight", "normal_disagreement"):
+                    outputs_stage[key] = sger_outputs[key]
+                depth = outputs_stage["depth_refined"]
+            else:
+                depth = depth_raw
 
             outputs[stage_key] = outputs_stage
             outputs.update(outputs_stage)

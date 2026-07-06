@@ -600,11 +600,11 @@ def depth_gradient_magnitude(depth, valid_mask):
     depth_dx = gradient_x(depth_norm).abs()
     depth_dy = gradient_y(depth_norm).abs()
     if depth_dx.numel() > 0:
-        grad[:, :, 1:] = torch.max(grad[:, :, 1:], depth_dx)
-        grad[:, :, :-1] = torch.max(grad[:, :, :-1], depth_dx)
+        grad = torch.max(grad, F.pad(depth_dx, (1, 0)))
+        grad = torch.max(grad, F.pad(depth_dx, (0, 1)))
     if depth_dy.numel() > 0:
-        grad[:, 1:, :] = torch.max(grad[:, 1:, :], depth_dy)
-        grad[:, :-1, :] = torch.max(grad[:, :-1, :], depth_dy)
+        grad = torch.max(grad, F.pad(depth_dy, (0, 0, 1, 0)))
+        grad = torch.max(grad, F.pad(depth_dy, (0, 0, 0, 1)))
     return grad
 
 
@@ -619,10 +619,10 @@ def curvature_magnitude(depth, valid_mask):
     curv = depth.new_zeros(depth.shape)
     if depth.size(2) >= 3:
         curv_x = (depth_norm[:, :, 2:] - 2 * depth_norm[:, :, 1:-1] + depth_norm[:, :, :-2]).abs()
-        curv[:, :, 1:-1] = torch.max(curv[:, :, 1:-1], curv_x)
+        curv = torch.max(curv, F.pad(curv_x, (1, 1)))
     if depth.size(1) >= 3:
         curv_y = (depth_norm[:, 2:, :] - 2 * depth_norm[:, 1:-1, :] + depth_norm[:, :-2, :]).abs()
-        curv[:, 1:-1, :] = torch.max(curv[:, 1:-1, :], curv_y)
+        curv = torch.max(curv, F.pad(curv_y, (0, 0, 1, 1)))
     return curv
 
 
@@ -850,6 +850,9 @@ def edge_aware_smooth_loss(depth, ref_img, mask):
 
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     depth_loss_weights = kwargs.get("dlossw", None)
+    raw_depth_loss_weight = kwargs.get("raw_depth_loss_weight", 0.5)
+    refined_depth_loss_weight = kwargs.get("refined_depth_loss_weight", 1.0)
+    residual_loss_weight = kwargs.get("residual_loss_weight", 0.001)
     imgs = kwargs.get("imgs", None)
     proj_matrices = kwargs.get("proj_matrices", None)
     normal_smooth_loss_weight = kwargs.get("normal_smooth_loss_weight", 0.0)
@@ -895,18 +898,47 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     for stage_key in stage_keys:
         stage_inputs = inputs[stage_key]
         depth_est = stage_inputs["depth"]
+        depth_raw = stage_inputs.get("depth_raw", None)
         depth_gt = depth_gt_ms[stage_key]
         mask = mask_ms[stage_key] > 0.5
+        stage_idx = int(stage_key.replace("stage", "")) - 1
 
-        depth_loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], reduction='mean')
+        refined_depth_loss = F.smooth_l1_loss(
+            depth_est[mask], depth_gt[mask], reduction='mean')
+        depth_loss = refined_depth_loss
+        if depth_raw is not None:
+            raw_depth_loss = F.smooth_l1_loss(
+                depth_raw[mask], depth_gt[mask], reduction='mean')
+            stage_depth_loss = (
+                refined_depth_loss_weight * refined_depth_loss
+                + raw_depth_loss_weight * raw_depth_loss)
+            extra["{}/raw_depth_loss".format(stage_key)] = raw_depth_loss.detach()
+            extra["{}/refined_depth_loss".format(stage_key)] = refined_depth_loss.detach()
+            raw_abs_error = masked_mean((depth_raw - depth_gt).abs(), mask)
+            refined_abs_error = masked_mean((depth_est - depth_gt).abs(), mask)
+            extra["{}/raw_to_refined_error_delta".format(stage_key)] = (
+                raw_abs_error - refined_abs_error).detach()
+        else:
+            stage_depth_loss = refined_depth_loss
+
+        if "depth_residual" in stage_inputs:
+            extra["{}/mean_abs_depth_residual".format(stage_key)] = masked_mean(
+                stage_inputs["depth_residual"].abs(), mask).detach()
+        if "geometry_gate" in stage_inputs:
+            extra["{}/geometry_gate_mean".format(stage_key)] = masked_mean(
+                stage_inputs["geometry_gate"], mask).detach()
+        if "region_a" in stage_inputs:
+            extra["{}/region_A_ratio".format(stage_key)] = masked_mean(
+                stage_inputs["region_a"].float(), mask).detach()
+        if "region_b_weight" in stage_inputs:
+            extra["{}/region_B_weight_mean".format(stage_key)] = masked_mean(
+                stage_inputs["region_b_weight"], mask).detach()
 
         if depth_loss_weights is not None:
-            stage_idx = int(stage_key.replace("stage", "")) - 1
-            total_loss += depth_loss_weights[stage_idx] * depth_loss
+            total_loss += depth_loss_weights[stage_idx] * stage_depth_loss
         else:
-            total_loss += 1.0 * depth_loss
+            total_loss += stage_depth_loss
         #  if int(stage_key.replace("stage", "")) > 2:
-        stage_idx = int(stage_key.replace("stage", "")) - 1
         geometry_mask = None
         geometry_weight = None
         if imgs is not None and "photometric_confidence" in stage_inputs:
@@ -990,6 +1022,10 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             edge_aware_smooth_loss_final = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
             total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
             extra["edge_smooth_loss"] = edge_aware_smooth_loss_final.detach()
+        if residual_loss_weight > 0 and "residual_ratio" in stage_inputs:
+            residual_loss = masked_mean(stage_inputs["residual_ratio"], mask)
+            total_loss += (residual_loss_weight / pow(2, stage_idx)) * residual_loss
+            extra["{}/residual_loss".format(stage_key)] = residual_loss.detach()
         if (depth_normal_loss_weight > 0 and imgs is not None and proj_matrices is not None
                 and stage_key in proj_matrices
                 and "normal" in stage_inputs and "photometric_confidence" in stage_inputs):

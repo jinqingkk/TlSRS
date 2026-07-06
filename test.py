@@ -41,6 +41,21 @@ parser.add_argument('--ndepths', type=str, default="48,32,8", help='ndepths')
 parser.add_argument('--depth_inter_r', type=str, default="4,2,1", help='depth_intervals_ratio')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
+parser.add_argument('--use_sger', action='store_true', help='enable per-stage SGER depth refinement')
+parser.add_argument('--sger_share', action='store_true', help='share the SGER core across stages')
+parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
+parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
+parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=2.0, help='maximum residual in stage depth intervals')
+parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
+parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
+parser.add_argument('--allow_legacy_checkpoint', action='store_true', help='allow loading a checkpoint without SGER parameters')
+parser.add_argument('--geometry_conf_mid', type=float, default=0.65)
+parser.add_argument('--geometry_k_conf', type=float, default=10.0)
+parser.add_argument('--region_edge_threshold', type=float, default=0.25)
+parser.add_argument('--region_depth_threshold', type=float, default=0.02)
+parser.add_argument('--region_curv_threshold', type=float, default=0.02)
+parser.add_argument('--region_smooth_k', type=float, default=2.0)
 
 parser.add_argument('--interval_scale', type=float, required=True, help='the depth interval scale')
 parser.add_argument('--num_view', type=int, default=5, help='num of view')
@@ -162,12 +177,33 @@ def save_scene_depth(testlist):
                           depth_interals_ratio=[float(d_i) for d_i in args.depth_inter_r.split(",") if d_i],
                           share_cr=args.share_cr,
                           cr_base_chs=[int(ch) for ch in args.cr_base_chs.split(",") if ch],
-                          grad_method=args.grad_method)
+                          grad_method=args.grad_method,
+                          use_sger=args.use_sger,
+                          sger_share=args.sger_share,
+                          sger_feature_channels=args.sger_feature_channels,
+                          sger_hidden_channels=args.sger_hidden_channels,
+                          sger_gate_channels=args.sger_gate_channels,
+                          sger_max_residual_ratio=args.sger_max_residual_ratio,
+                          detach_refined_feedback=args.detach_refined_feedback,
+                          sger_gate_kwargs={
+                              "threshold_edge": args.region_edge_threshold,
+                              "threshold_depth": args.region_depth_threshold,
+                              "threshold_curv": args.region_curv_threshold,
+                              "conf_mid": args.geometry_conf_mid,
+                              "k_conf": args.geometry_k_conf,
+                              "smooth_k": args.region_smooth_k,
+                          })
 
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
     state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
-    model.load_state_dict(state_dict['model'], strict=True)
+    load_result = model.load_state_dict(
+        state_dict['model'], strict=not args.allow_legacy_checkpoint)
+    if args.allow_legacy_checkpoint:
+        if load_result.missing_keys:
+            print("missing keys when loading legacy checkpoint:", load_result.missing_keys)
+        if load_result.unexpected_keys:
+            print("unexpected keys when loading legacy checkpoint:", load_result.unexpected_keys)
     model = nn.DataParallel(model)
     model.cuda()
     model.eval()
