@@ -1,0 +1,11 @@
+推荐方案：在现有 SGER 实现上收敛成 --use_sger_lite / Stage3-only 路径。
+
+  - Stage1、Stage2：不运行 NormalHead，不创建/输出 SGER 字段，depth 保持原始 CasMVSNet 输出，并继续作为下一阶段采样中心。
+  - Stage3：运行 NormalHead + SGERBlock，保存 depth_raw、depth_refined、depth_residual、geometry_gate 等；顶层 outputs["depth"] 默认使用 refined depth，但同时保留 raw 便于训练、日志和
+    测试导出。
+
+  - 不使用 refined depth 跨阶段反馈：因为只在 Stage3 refine，所以 Stage1->Stage2->Stage3 的搜索中心天然全是 raw depth。
+  - 默认实验参数改成你给的 Lite 值：sger_max_residual_ratio=0.5，raw_depth_loss_weight=1.0，refined_depth_loss_weight=1.0，residual_loss_weight=0.005。
+  - 增加 --freeze_backbone_epochs，前 6 个 epoch 只训练 Stage3 NormalHead + SGERBlock，之后解冻全模型。
+  - 测试导出同时保存 depth_est_raw/、depth_est/，并增加残差校准置信度 confidence_residual_calibrated/；融合时用参数选择 confidence 或校准置信度，便于跑两套点云对比。
+  - checkpoint 初始化支持直接从实验 8 checkpoint 加载：SGER Lite 新增参数缺失允许，原 CasMVSNet 权重严格对齐，避免静默吞掉主干不匹配。

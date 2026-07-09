@@ -122,6 +122,47 @@ def test_cascade_sger_returns_raw_and_refined_depth_for_every_stage():
     assert torch.allclose(outputs["depth"], outputs["stage3"]["depth_refined"])
 
 
+def test_cascade_sger_lite_refines_stage3_only():
+    torch.manual_seed(5)
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+        sger_hidden_channels=16,
+        sger_gate_channels=8,
+        sger_max_residual_ratio=0.5,
+    )
+    model.eval()
+    imgs = torch.rand(1, 3, 3, 32, 32)
+    depth_values = torch.linspace(1.0, 2.0, 8).view(1, 8)
+    proj_matrices = {
+        "stage1": _identity_proj(1, 3),
+        "stage2": _identity_proj(1, 3),
+        "stage3": _identity_proj(1, 3),
+    }
+
+    with torch.no_grad():
+        outputs = model(imgs, proj_matrices, depth_values)
+
+    for stage_key in ("stage1", "stage2"):
+        assert "normal" not in outputs[stage_key]
+        assert "depth_raw" not in outputs[stage_key]
+        assert "depth_refined" not in outputs[stage_key]
+        assert "depth_residual" not in outputs[stage_key]
+        assert "geometry_gate" not in outputs[stage_key]
+        assert torch.allclose(outputs[stage_key]["depth"], outputs[stage_key]["depth"])
+    stage3 = outputs["stage3"]
+    assert "normal" in stage3
+    assert "depth_raw" in stage3
+    assert "depth_refined" in stage3
+    assert "depth_residual" in stage3
+    assert "geometry_gate" in stage3
+    assert torch.allclose(stage3["depth"], stage3["depth_refined"])
+    assert torch.allclose(outputs["depth"], stage3["depth_refined"])
+    assert torch.allclose(outputs["depth_raw"], stage3["depth_raw"])
+    assert torch.allclose(outputs["depth_refined"], stage3["depth_refined"])
+
+
 def test_cascade_disabled_path_has_no_sger_only_outputs():
     model = CascadeMVSNet(
         ndepths=[8, 8, 8],
@@ -307,6 +348,25 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
     assert 'use_sger=args.use_sger' in test_source
     for image_key in ("depth_raw", "depth_residual", "geometry_gate", "region_a"):
         assert 'image_outputs["{}"]'.format(image_key) in train_source
+    for source in (train_source, test_source):
+        assert "--use_sger_lite" in source
+        assert "--sger_max_residual_ratio', type=float, default=0.5" in source
+    for flag in (
+        "--freeze_backbone_epochs",
+        "--raw_depth_loss_weight', type=float, default=1.0",
+        "--refined_depth_loss_weight', type=float, default=1.0",
+        "--residual_loss_weight', type=float, default=0.005",
+    ):
+        assert flag in train_source
+    for export_hook in (
+        "depth_est_raw",
+        "confidence_residual_calibrated",
+        "--fusion_depth_source",
+        "--fusion_confidence_source",
+        "get_fusion_depth_folder",
+        "get_fusion_confidence_folder",
+    ):
+        assert export_hook in test_source
 
 
 if __name__ == "__main__":
@@ -315,6 +375,7 @@ if __name__ == "__main__":
     test_sger_sanitizes_nonfinite_depth_before_geometry_processing()
     test_sger_refined_depth_backpropagates_through_learned_path()
     test_cascade_sger_returns_raw_and_refined_depth_for_every_stage()
+    test_cascade_sger_lite_refines_stage3_only()
     test_cascade_disabled_path_has_no_sger_only_outputs()
     test_cascade_shared_sger_mode_runs_all_stages()
     test_cascade_uses_refined_depth_as_next_stage_sampling_center()
@@ -322,4 +383,3 @@ if __name__ == "__main__":
     test_sger_loss_regularizes_normalized_gated_residual()
     test_train_and_test_entrypoints_expose_sger_configuration()
     print("SGER unit tests: PASS")
-

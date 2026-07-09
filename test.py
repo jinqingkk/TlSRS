@@ -42,11 +42,12 @@ parser.add_argument('--depth_inter_r', type=str, default="4,2,1", help='depth_in
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 parser.add_argument('--use_sger', action='store_true', help='enable per-stage SGER depth refinement')
+parser.add_argument('--use_sger_lite', action='store_true', help='enable Stage3-only SGER-Lite depth refinement')
 parser.add_argument('--sger_share', action='store_true', help='share the SGER core across stages')
 parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
-parser.add_argument('--sger_max_residual_ratio', type=float, default=2.0, help='maximum residual in stage depth intervals')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=0.5, help='maximum residual in stage depth intervals')
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--allow_legacy_checkpoint', action='store_true', help='allow loading a checkpoint without SGER parameters')
@@ -68,6 +69,10 @@ parser.add_argument('--save_freq', type=int, default=20, help='save freq of loca
 
 
 parser.add_argument('--filter_method', type=str, default='normal', choices=["gipuma", "normal"], help="filter method")
+parser.add_argument('--fusion_depth_source', type=str, default='refined', choices=["refined", "raw"],
+                    help='depth folder used by normal point-cloud fusion')
+parser.add_argument('--fusion_confidence_source', type=str, default='raw', choices=["raw", "residual_calibrated"],
+                    help='confidence folder used by normal point-cloud fusion')
 
 #filter
 parser.add_argument('--conf', type=float, default=0.9, help='prob confidence')
@@ -84,6 +89,8 @@ parser.add_argument('--num_consistent', type=float, default='4')
 args = parser.parse_args()
 print("argv:", sys.argv[1:])
 print_args(args)
+if args.use_sger and args.use_sger_lite:
+    raise ValueError("--use_sger and --use_sger_lite are mutually exclusive")
 if args.testpath_single_scene:
     args.testpath = os.path.dirname(args.testpath_single_scene)
 
@@ -91,6 +98,42 @@ num_stage = len([int(nd) for nd in args.ndepths.split(",") if nd])
 
 Interval_Scale = args.interval_scale
 print("***********Interval_Scale**********\n", Interval_Scale)
+
+
+def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger, use_sger_lite=False):
+    if not (use_sger or use_sger_lite):
+        return
+    allowed_missing_prefixes = (
+        "sger_blocks.",
+        "shared_sger.",
+        "sger_feature_adapters.",
+    )
+    invalid_missing = [
+        key for key in missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if invalid_missing or unexpected_keys:
+        raise RuntimeError(
+            "checkpoint is incompatible with SGER initialization; "
+            "unrelated missing keys: {}; unexpected keys: {}".format(
+                invalid_missing, list(unexpected_keys)))
+
+
+def residual_calibrated_confidence(confidence, residual_ratio):
+    calibrated = confidence * np.exp(-np.maximum(residual_ratio, 0.0))
+    return np.clip(calibrated, 0.0, 1.0).astype(np.float32)
+
+
+def get_fusion_confidence_folder():
+    if args.fusion_confidence_source == "residual_calibrated":
+        return "confidence_residual_calibrated"
+    return "confidence"
+
+
+def get_fusion_depth_folder():
+    if args.fusion_depth_source == "raw":
+        return "depth_est_raw"
+    return "depth_est"
 
 
 # read intrinsics and extrinsics
@@ -179,6 +222,7 @@ def save_scene_depth(testlist):
                           cr_base_chs=[int(ch) for ch in args.cr_base_chs.split(",") if ch],
                           grad_method=args.grad_method,
                           use_sger=args.use_sger,
+                          use_sger_lite=args.use_sger_lite,
                           sger_share=args.sger_share,
                           sger_feature_channels=args.sger_feature_channels,
                           sger_hidden_channels=args.sger_hidden_channels,
@@ -197,13 +241,17 @@ def save_scene_depth(testlist):
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
     state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
+    allow_sger_initialization = args.allow_legacy_checkpoint or args.use_sger or args.use_sger_lite
     load_result = model.load_state_dict(
-        state_dict['model'], strict=not args.allow_legacy_checkpoint)
-    if args.allow_legacy_checkpoint:
+        state_dict['model'], strict=not allow_sger_initialization)
+    if allow_sger_initialization:
+        validate_checkpoint_keys(
+            load_result.missing_keys, load_result.unexpected_keys,
+            args.use_sger, args.use_sger_lite)
         if load_result.missing_keys:
-            print("missing keys when loading legacy checkpoint:", load_result.missing_keys)
+            print("missing keys when loading checkpoint:", load_result.missing_keys)
         if load_result.unexpected_keys:
-            print("unexpected keys when loading legacy checkpoint:", load_result.unexpected_keys)
+            print("unexpected keys when loading checkpoint:", load_result.unexpected_keys)
     model = nn.DataParallel(model)
     model.cuda()
     model.eval()
@@ -222,24 +270,36 @@ def save_scene_depth(testlist):
             print('Iter {}/{}, Time:{} Res:{}'.format(batch_idx, len(TestImgLoader), end_time - start_time, imgs[0].shape))
 
             # save depth maps and confidence maps
-            for filename, cam, img, depth_est, photometric_confidence in zip(filenames, cams, imgs, \
-                                                            outputs["depth"], outputs["photometric_confidence"]):
+            depth_raw_outputs = outputs["depth_raw"] if "depth_raw" in outputs else outputs["depth"]
+            residual_ratio_outputs = outputs["residual_ratio"] if "residual_ratio" in outputs else [
+                np.zeros_like(depth) for depth in outputs["depth"]]
+            for filename, cam, img, depth_est, depth_raw, photometric_confidence, residual_ratio in zip(
+                    filenames, cams, imgs, outputs["depth"], depth_raw_outputs,
+                    outputs["photometric_confidence"], residual_ratio_outputs):
                 img = img[0]  #ref view
                 cam = cam[0]  #ref cam
                 depth_filename = os.path.join(args.outdir, filename.format('depth_est', '.pfm'))
+                depth_raw_filename = os.path.join(args.outdir, filename.format('depth_est_raw', '.pfm'))
                 confidence_filename = os.path.join(args.outdir, filename.format('confidence', '.pfm'))
+                confidence_calibrated_filename = os.path.join(
+                    args.outdir, filename.format('confidence_residual_calibrated', '.pfm'))
                 cam_filename = os.path.join(args.outdir, filename.format('cams', '_cam.txt'))
                 img_filename = os.path.join(args.outdir, filename.format('images', '.jpg'))
                 ply_filename = os.path.join(args.outdir, filename.format('ply_local', '.ply'))
                 os.makedirs(depth_filename.rsplit('/', 1)[0], exist_ok=True)
+                os.makedirs(depth_raw_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(confidence_filename.rsplit('/', 1)[0], exist_ok=True)
+                os.makedirs(confidence_calibrated_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(cam_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(img_filename.rsplit('/', 1)[0], exist_ok=True)
                 os.makedirs(ply_filename.rsplit('/', 1)[0], exist_ok=True)
                 #save depth maps
                 save_pfm(depth_filename, depth_est)
+                save_pfm(depth_raw_filename, depth_raw)
                 #save confidence maps
                 save_pfm(confidence_filename, photometric_confidence)
+                save_pfm(confidence_calibrated_filename,
+                         residual_calibrated_confidence(photometric_confidence, residual_ratio))
                 #save cams, img
                 write_cam(cam_filename, cam)
                 img = np.clip(np.transpose(img, (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
@@ -349,9 +409,11 @@ def filter_depth(pair_folder, scan_folder, out_folder, plyfilename):
         # load the reference image
         ref_img = read_img(os.path.join(scan_folder, 'images/{:0>8}.jpg'.format(ref_view)))
         # load the estimated depth of the reference view
-        ref_depth_est = read_pfm(os.path.join(out_folder, 'depth_est/{:0>8}.pfm'.format(ref_view)))[0]
+        depth_folder = get_fusion_depth_folder()
+        ref_depth_est = read_pfm(os.path.join(out_folder, '{}/{:0>8}.pfm'.format(depth_folder, ref_view)))[0]
         # load the photometric mask of the reference view
-        confidence = read_pfm(os.path.join(out_folder, 'confidence/{:0>8}.pfm'.format(ref_view)))[0]
+        confidence_folder = get_fusion_confidence_folder()
+        confidence = read_pfm(os.path.join(out_folder, '{}/{:0>8}.pfm'.format(confidence_folder, ref_view)))[0]
         photo_mask = confidence > args.conf
 
         all_srcview_depth_ests = []
@@ -366,7 +428,7 @@ def filter_depth(pair_folder, scan_folder, out_folder, plyfilename):
             src_intrinsics, src_extrinsics = read_camera_parameters(
                 os.path.join(scan_folder, 'cams/{:0>8}_cam.txt'.format(src_view)))
             # the estimated depth of the source view
-            src_depth_est = read_pfm(os.path.join(out_folder, 'depth_est/{:0>8}.pfm'.format(src_view)))[0]
+            src_depth_est = read_pfm(os.path.join(out_folder, '{}/{:0>8}.pfm'.format(depth_folder, src_view)))[0]
 
             geo_mask, depth_reprojected, x2d_src, y2d_src = check_geometric_consistency(ref_depth_est, ref_intrinsics, ref_extrinsics,
                                                                       src_depth_est,
