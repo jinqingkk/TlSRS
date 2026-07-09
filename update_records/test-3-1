@@ -1,0 +1,249 @@
+下面按“原 CasMVSNet 主流程没有被推翻，而是在每个 cascade stage 后加了 SGER 几何细化”的角度解释。
+
+  整体结构
+
+  你现在的 SGER-CasMVSNet 仍然保留原来的 CasMVSNet 主干：
+
+  多视图图像
+    -> FeatureNet 提取多尺度特征
+    -> stage1 / stage2 / stage3 逐级深度采样
+    -> DepthNet 构建 cost volume 并回归深度
+    -> NormalHead 预测法线
+    -> SGERBlock 可选地细化当前 stage 深度
+    -> 下一 stage 使用上一 stage 深度继续缩小搜索范围
+
+  核心改动集中在三个地方：
+
+  - models/cas_mvsnet.py:72：把 SGER 模块接入 cascade 网络。
+  - models/sger_refinement.py:1：新增 SGER 深度细化模块。
+  - models/module.py:851：扩展训练 loss，让 raw depth、refined depth、残差和几何约束共同参与训练。
+
+  1. 原始深度估计仍然来自 CasMVSNet
+
+  每个 stage 先走原来的 DepthNet。它做的事情没有本质改变：
+
+  reference feature + source features
+    -> homography warping
+    -> variance cost volume
+    -> CostRegNet 正则化
+    -> softmax 概率体
+    -> depth regression
+
+  这个输出在 SGER 里叫：
+
+  depth_raw
+
+  也就是“未经 SGER 细化的原始 stage 深度”。
+
+  在 models/cas_mvsnet.py:208 附近可以看到：
+
+  depth_raw = outputs_stage["depth"]
+
+  2. 每个 stage 新增 NormalHead
+
+  每个 stage 现在还会预测一个 surface normal：
+
+  ref_feature + depth + photometric_confidence
+    -> NormalHead
+    -> normal
+
+  输入不是只看图像特征，而是把当前 stage 的：
+
+  - 参考图像特征 ref_feature
+  - 当前预测深度 depth
+  - 光度置信度 photometric_confidence
+
+  拼接后送入法线头。
+
+  法线头定义在 models/module.py:502。它是一个轻量 CNN，最后输出 3 通道，并用 F.normalize 归一化成单位法线。
+
+  这个法线后面有两个用途：
+
+  - 作为 SGERBlock 的几何输入。
+  - 在 loss 中参与深度-法线一致性约束。
+
+  3. SGERBlock 做什么
+
+  SGERBlock 是这次改动的核心，定义在 models/sger_refinement.py:129。
+
+  它的输入主要是：
+
+  depth_raw
+  normal_pred
+  photometric_confidence
+  reference image
+  camera intrinsics
+  reference feature
+  depth interval
+
+  它输出：
+
+  depth_refined
+  depth_residual
+  geometry_gate
+  region_a
+  region_b
+  region_b_weight
+  normal_depth
+  normal_disagreement
+
+  可以理解成：
+
+  细化深度 = 原始深度 + 几何门控 * 有界残差
+
+  代码逻辑对应：
+
+  raw_residual = max_residual * torch.tanh(residual_logit)
+  gated_residual = gate * raw_residual
+  depth_refined = depth + gated_residual
+
+  其中 tanh 用来限制残差范围，避免 SGER 一次把深度改得太离谱。最大残差由：
+
+  sger_max_residual_ratio * depth_interval
+
+  控制。默认 sger_max_residual_ratio=2.0。
+
+  4. GeometryCueExtractor 提取几何线索
+
+  SGERBlock 里面第一步是 GeometryCueExtractor，在 models/sger_refinement.py:18。
+
+  它会从当前预测结果中构造一组几何 cue：
+
+  - 归一化深度 depth_normalized
+  - 网络预测法线 normal_pred
+  - 由深度和相机内参反算出的法线 normal_depth
+  - 两种法线的不一致度 normal_disagreement
+  - 光度置信度 confidence
+  - 图像边缘强度 image_edge
+  - 深度梯度 depth_edge
+  - 深度曲率 curvature
+  - 参考 RGB 图像 ref_img
+
+  这些会拼成一个 cue_tensor，再和参考特征融合，用来决定哪里该改深度、改多少。
+
+  5. DualRegionGate：区分硬区域和软区域
+
+  SGER 不是全图统一细化，而是通过几何区域控制。
+
+  DualRegionGate 在 models/sger_refinement.py:73。
+
+  它调用 models/module.py:680 里的 build_dual_region_geometry()，把像素分成：
+
+  - Region A：硬几何区域。通常是高置信、非明显图像边缘、深度梯度/曲率满足条件的区域。
+  - Region B：软几何区域。不是强硬约束，而是用连续权重 region_b_weight 控制。
+
+  然后再用两个小 CNN 学习：
+
+  learned_a
+  learned_b
+
+  最终 gate 近似是：
+
+  gate = region_a * learned_a + weight_b * learned_b
+
+  所以 SGER 的深度残差不是无条件加上去，而是由几何可靠性和学习到的 gate 共同决定。
+
+  6. refined depth 会替换当前 stage 输出
+
+  如果启用了 --use_sger，在 models/cas_mvsnet.py:228 附近：
+
+  outputs_stage["depth_raw"] = depth_raw
+  outputs_stage["depth_refined"] = sger_outputs["depth_refined"]
+  outputs_stage["depth"] = sger_outputs["depth_refined"]
+
+  也就是说：
+
+  - depth_raw 保留原始 CasMVSNet 深度。
+  - depth_refined 是 SGER 细化后的深度。
+  - 对外的 depth 会变成 refined depth。
+
+  最终 outputs["depth"] 默认就是 stage3 的 refined depth。
+
+  7. 下一 stage 使用 refined depth 作为采样中心
+
+  这是一个很关键的点。
+
+  普通 CasMVSNet 里，stage2 / stage3 会以上一 stage 的深度作为中心，构建更窄的深度搜索范围。
+
+  现在开启 --use_sger 后，上一 stage 的深度已经是 refined depth，所以后续 stage 会围绕更精细的深度继续采样。
+
+  相关逻辑在 models/cas_mvsnet.py:166。
+
+  默认参数：
+
+  detach_refined_feedback=True
+
+  意思是 refined depth 作为下一 stage 采样中心时默认 detach，避免跨 stage 反馈链过长导致训练不稳定。如果你想让梯度穿过 refined-depth feedback，可以用：
+
+  --allow_refined_feedback_grad
+
+  8. SGER 有两种使用方式
+
+  在 models/cas_mvsnet.py:119：
+
+  一种是每个 stage 独立一个 SGERBlock：
+
+  --use_sger
+
+  另一种是共享 SGER 主体：
+
+  --use_sger --sger_share
+
+  共享模式下，不同 stage 的 feature channel 可能不同，所以代码加了 sger_feature_adapters，先用 1x1 conv 把各 stage 特征投影到统一通道数，再送入共享 SGER。
+
+  9. Loss 怎么变了
+
+  原始 CasMVSNet 主要监督每个 stage 的 depth smooth L1。
+
+  现在 models/module.py:851 的 cas_mvsnet_loss 扩展了几类监督。
+
+  如果没有 SGER，仍然监督 depth。
+
+  如果有 SGER，则会分别监督：
+
+  raw depth loss
+  refined depth loss
+
+  对应参数：
+
+  --raw_depth_loss_weight 0.5
+  --refined_depth_loss_weight 1.0
+
+  也就是说，网络不会只要求 refined depth 好，也会保留对 raw CasMVSNet 深度的约束，防止主干退化成完全依赖后处理残差。
+
+  另外还有：
+
+  --residual_loss_weight 0.001
+
+  它约束 normalized residual，避免 SGER 残差过大。
+
+  10. 额外几何约束
+
+  loss 中还保留/加入了这些几何正则：
+
+  - normal_smooth_loss：法线平滑。
+  - curv_loss：曲率连续性。
+  - edge_smooth_loss：边缘感知平滑。
+  - depth_normal_loss：预测法线和由深度反算法线的一致性。
+  - dual_region_curvature_loss：Region A / Region B 双区域曲率约束。
+
+  这些参数在 train.py:53 附近，例如：
+
+  --normal_smooth_loss_weight 0.02
+  --curv_loss_weight 0.005
+  --edge_smooth_loss_weight 0.005
+  --depth_normal_loss_weight 0.03
+  --use_dual_region_curvature
+
+  整体目标是：深度不仅要接近 GT，还要在几何上更平滑、更连续，同时不要把真实边缘过度抹平。
+
+  一句话总结
+
+  你现在的 SGER-CasMVSNet 是：
+
+  CasMVSNet 负责多视图匹配和初始深度估计；
+  NormalHead 提供每个 stage 的表面法线；
+  SGERBlock 根据深度、法线、置信度、边缘、曲率和参考特征，学习一个受几何门控控制的深度残差；
+  训练时同时约束 raw depth、refined depth、残差幅度、法线一致性、曲率连续性和边缘感知平滑。
+
+  所以它不是把 CasMVSNet 改成了另一个网络，而是在每个级联阶段后面加了一个“自几何约束的深度细化器”，目标是让最终深度在大型混凝土管片这类表面上更稳定、更连续，同时保留边缘结构。

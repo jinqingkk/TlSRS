@@ -72,16 +72,18 @@ parser.add_argument('--region_smooth_k', type=float, default=2.0, help='image-gr
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 parser.add_argument('--use_sger', action='store_true', help='enable per-stage SGER depth refinement')
+parser.add_argument('--use_sger_lite', action='store_true', help='enable Stage3-only SGER-Lite depth refinement')
 parser.add_argument('--sger_share', action='store_true', help='share the SGER core across stages')
 parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
-parser.add_argument('--sger_max_residual_ratio', type=float, default=2.0, help='maximum residual in stage depth intervals')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=0.5, help='maximum residual in stage depth intervals')
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
-parser.add_argument('--raw_depth_loss_weight', type=float, default=0.5, help='auxiliary raw stage depth loss weight')
+parser.add_argument('--raw_depth_loss_weight', type=float, default=1.0, help='auxiliary raw stage depth loss weight')
 parser.add_argument('--refined_depth_loss_weight', type=float, default=1.0, help='refined stage depth loss weight')
-parser.add_argument('--residual_loss_weight', type=float, default=0.001, help='normalized SGER residual regularization weight')
+parser.add_argument('--residual_loss_weight', type=float, default=0.005, help='normalized SGER residual regularization weight')
+parser.add_argument('--freeze_backbone_epochs', type=int, default=0, help='freeze non-SGER-Lite backbone for the first N epochs')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -124,8 +126,8 @@ def loss_kwargs(sample_cuda, args):
     }
 
 
-def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger):
-    if not use_sger:
+def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger, use_sger_lite=False):
+    if not (use_sger or use_sger_lite):
         return
     allowed_missing_prefixes = (
         "sger_blocks.",
@@ -143,6 +145,20 @@ def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger):
                 invalid_missing, list(unexpected_keys)))
 
 
+def set_sger_lite_freeze(model, freeze_backbone):
+    module = model.module if hasattr(model, "module") else model
+    if not getattr(module, "use_sger_lite", False):
+        return
+    trainable_prefixes = (
+        "normal_head.{}.".format(module.num_stage - 1),
+        "sger_blocks.",
+        "shared_sger.",
+        "sger_feature_adapters.{}.".format(module.num_stage - 1),
+    )
+    for name, param in module.named_parameters():
+        param.requires_grad = (not freeze_backbone) or name.startswith(trainable_prefixes)
+
+
 # main function
 def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epoch, args):
     milestones = [len(TrainImgLoader) * int(epoch_idx) for epoch_idx in args.lrepochs.split(':')[0].split(',')]
@@ -152,6 +168,10 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
 
     for epoch_idx in range(start_epoch, args.epochs):
         print('Epoch {}:'.format(epoch_idx))
+        freeze_backbone = args.use_sger_lite and epoch_idx < args.freeze_backbone_epochs
+        set_sger_lite_freeze(model, freeze_backbone)
+        if freeze_backbone and ((not is_distributed) or (dist.get_rank() == 0)):
+            print("SGER-Lite freeze: training Stage3 NormalHead and SGERBlock only")
         global_step = len(TrainImgLoader) * epoch_idx
 
         # training
@@ -402,6 +422,8 @@ if __name__ == '__main__':
     if args.resume:
         assert args.mode == "train"
         assert args.loadckpt is None
+    if args.use_sger and args.use_sger_lite:
+        raise ValueError("--use_sger and --use_sger_lite are mutually exclusive")
     if args.testpath is None:
         args.testpath = args.trainpath
 
@@ -434,6 +456,7 @@ if __name__ == '__main__':
                           cr_base_chs=[int(ch) for ch in args.cr_base_chs.split(",") if ch],
                           grad_method=args.grad_method,
                           use_sger=args.use_sger,
+                          use_sger_lite=args.use_sger_lite,
                           sger_share=args.sger_share,
                           sger_feature_channels=args.sger_feature_channels,
                           sger_hidden_channels=args.sger_hidden_channels,
@@ -475,7 +498,7 @@ if __name__ == '__main__':
         print("loading model {}".format(args.loadckpt))
         state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
         missing_keys, unexpected_keys = model.load_state_dict(state_dict['model'], strict=False)
-        validate_checkpoint_keys(missing_keys, unexpected_keys, args.use_sger)
+        validate_checkpoint_keys(missing_keys, unexpected_keys, args.use_sger, args.use_sger_lite)
         if missing_keys:
             print("missing keys when loading checkpoint:", missing_keys)
         if unexpected_keys:

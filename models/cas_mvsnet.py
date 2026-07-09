@@ -70,10 +70,13 @@ class DepthNet(nn.Module):
 class CascadeMVSNet(nn.Module):
     def __init__(self, refine=False, ndepths=[48, 32, 8], depth_interals_ratio=[4, 2, 1], share_cr=False,
                  grad_method="detach", arch_mode="fpn", cr_base_chs=[8, 8, 8], use_sger=False,
+                 use_sger_lite=False,
                  sger_share=False, sger_feature_channels=8, sger_hidden_channels=32,
-                 sger_gate_channels=16, sger_max_residual_ratio=2.0,
+                 sger_gate_channels=16, sger_max_residual_ratio=0.5,
                  detach_refined_feedback=True, sger_gate_kwargs=None):
         super(CascadeMVSNet, self).__init__()
+        if use_sger and use_sger_lite:
+            raise ValueError("use_sger and use_sger_lite are mutually exclusive")
         self.refine = refine
         self.share_cr = share_cr
         self.ndepths = ndepths
@@ -82,6 +85,8 @@ class CascadeMVSNet(nn.Module):
         self.arch_mode = arch_mode
         self.cr_base_chs = cr_base_chs
         self.use_sger = use_sger
+        self.use_sger_lite = use_sger_lite
+        self.sger_enabled = use_sger or use_sger_lite
         self.sger_share = sger_share
         self.detach_refined_feedback = detach_refined_feedback
         self.sger_gate_kwargs = sger_gate_kwargs or {}
@@ -116,7 +121,7 @@ class CascadeMVSNet(nn.Module):
         self.normal_head = nn.ModuleList([
             NormalHead(out_channels + 2) for out_channels in self.feature.out_channels[:self.num_stage]
         ])
-        if self.use_sger:
+        if self.sger_enabled:
             if self.sger_share:
                 self.sger_feature_adapters = nn.ModuleList([
                     nn.Conv2d(out_channels, sger_feature_channels, 1, bias=False)
@@ -138,7 +143,10 @@ class CascadeMVSNet(nn.Module):
                         gate_channels=sger_gate_channels,
                         max_residual_ratio=sger_max_residual_ratio,
                         **self.sger_gate_kwargs)
-                    for out_channels in self.feature.out_channels[:self.num_stage]
+                    for out_channels in (
+                        [self.feature.out_channels[self.num_stage - 1]]
+                        if self.use_sger_lite
+                        else self.feature.out_channels[:self.num_stage])
                 ])
 
     def forward(self, imgs, proj_matrices, depth_values):
@@ -190,23 +198,25 @@ class CascadeMVSNet(nn.Module):
                                           num_depth=self.ndepths[stage_idx],
                                           cost_regularization=self.cost_regularization if self.share_cr else self.cost_regularization[stage_idx])
 
-            depth = outputs_stage['depth']
-            ref_feature = features_stage[0]
-            depth_input = depth.unsqueeze(1)
-            confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
-            if depth_input.shape[-2:] != ref_feature.shape[-2:]:
-                depth_input = F.interpolate(depth_input, size=ref_feature.shape[-2:],
-                                            mode='bilinear',
-                                            align_corners=Align_Corners_Range)
-            if confidence_input.shape[-2:] != ref_feature.shape[-2:]:
-                confidence_input = F.interpolate(confidence_input, size=ref_feature.shape[-2:],
-                                                 mode='bilinear',
-                                                 align_corners=Align_Corners_Range)
-            normal_input = torch.cat([ref_feature, depth_input, confidence_input], dim=1)
-            outputs_stage["normal"] = self.normal_head[stage_idx](normal_input)
-
             depth_raw = outputs_stage["depth"]
-            if self.use_sger:
+            ref_feature = features_stage[0]
+            run_normal_head = (not self.use_sger_lite) or (stage_idx == self.num_stage - 1)
+            if run_normal_head:
+                depth_input = depth_raw.unsqueeze(1)
+                confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
+                if depth_input.shape[-2:] != ref_feature.shape[-2:]:
+                    depth_input = F.interpolate(depth_input, size=ref_feature.shape[-2:],
+                                                mode='bilinear',
+                                                align_corners=Align_Corners_Range)
+                if confidence_input.shape[-2:] != ref_feature.shape[-2:]:
+                    confidence_input = F.interpolate(confidence_input, size=ref_feature.shape[-2:],
+                                                     mode='bilinear',
+                                                     align_corners=Align_Corners_Range)
+                normal_input = torch.cat([ref_feature, depth_input, confidence_input], dim=1)
+                outputs_stage["normal"] = self.normal_head[stage_idx](normal_input)
+
+            run_sger = self.use_sger or (self.use_sger_lite and stage_idx == self.num_stage - 1)
+            if run_sger:
                 ref_img_stage = F.interpolate(
                     imgs[:, 0], size=depth_raw.shape[-2:],
                     mode='bilinear', align_corners=Align_Corners_Range)
@@ -216,7 +226,7 @@ class CascadeMVSNet(nn.Module):
                     sger_block = self.shared_sger
                 else:
                     sger_feature = ref_feature
-                    sger_block = self.sger_blocks[stage_idx]
+                    sger_block = self.sger_blocks[0 if self.use_sger_lite else stage_idx]
                 sger_outputs = sger_block(
                     depth_raw,
                     outputs_stage["normal"],
