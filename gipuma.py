@@ -112,7 +112,7 @@ def fake_gipuma_normal(in_depth_path, out_normal_path):
     return
 
 
-def mvsnet_to_gipuma(dense_folder, gipuma_point_folder):
+def mvsnet_to_gipuma(dense_folder, gipuma_point_folder, depth_folder="depth_est"):
     image_folder = os.path.join(dense_folder, 'images')
     cam_folder = os.path.join(dense_folder, 'cams')
 
@@ -147,23 +147,23 @@ def mvsnet_to_gipuma(dense_folder, gipuma_point_folder):
         sub_depth_folder = os.path.join(gipuma_point_folder, gipuma_prefix + image_prefix)
         if not os.path.isdir(sub_depth_folder):
             os.mkdir(sub_depth_folder)
-        in_depth_pfm = os.path.join(dense_folder, "depth_est", image_prefix + '_prob_filtered.pfm')
+        in_depth_pfm = os.path.join(dense_folder, depth_folder, image_prefix + '_prob_filtered.pfm')
         out_depth_dmb = os.path.join(sub_depth_folder, 'disp.dmb')
         fake_normal_dmb = os.path.join(sub_depth_folder, 'normals.dmb')
         mvsnet_to_gipuma_dmb(in_depth_pfm, out_depth_dmb)
         fake_gipuma_normal(out_depth_dmb, fake_normal_dmb)
 
 
-def probability_filter(dense_folder, prob_threshold):
+def probability_filter(dense_folder, prob_threshold, depth_folder="depth_est", confidence_folder="confidence"):
     image_folder = os.path.join(dense_folder, 'images')
 
     # convert cameras
     image_names = os.listdir(image_folder)
     for image_name in image_names:
         image_prefix = os.path.splitext(image_name)[0]
-        init_depth_map_path = os.path.join(dense_folder, "depth_est", image_prefix + '.pfm')
-        prob_map_path = os.path.join(dense_folder, "confidence", image_prefix + '.pfm')
-        out_depth_map_path = os.path.join(dense_folder, "depth_est", image_prefix + '_prob_filtered.pfm')
+        init_depth_map_path = os.path.join(dense_folder, depth_folder, image_prefix + '.pfm')
+        prob_map_path = os.path.join(dense_folder, confidence_folder, image_prefix + '.pfm')
+        out_depth_map_path = os.path.join(dense_folder, depth_folder, image_prefix + '_prob_filtered.pfm')
 
         depth_map, _ = read_pfm(init_depth_map_path)
         prob_map, _ = read_pfm(prob_map_path)
@@ -193,7 +193,8 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
     return
 
 
-def gipuma_filter(testlist, outdir, prob_threshold, disp_threshold, num_consistent, fusibile_exe_path):
+def gipuma_filter(testlist, outdir, prob_threshold, disp_threshold, num_consistent, fusibile_exe_path,
+                  depth_folder="depth_est", confidence_folder="confidence"):
 
     # 获取当前时间作为当前处理批号，用作文件夹名，放点云文件
     batch_num = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -212,11 +213,11 @@ def gipuma_filter(testlist, outdir, prob_threshold, disp_threshold, num_consiste
 
         # probability filter
         print('filter depth map with probability map')
-        probability_filter(dense_folder, prob_threshold)
+        probability_filter(dense_folder, prob_threshold, depth_folder, confidence_folder)
 
         # convert to gipuma format
         print('Convert mvsnet output to gipuma input')
-        mvsnet_to_gipuma(dense_folder, point_folder)
+        mvsnet_to_gipuma(dense_folder, point_folder, depth_folder)
 
         # depth map fusion with gipuma
         print('Run depth map fusion & filter')

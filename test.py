@@ -561,4 +561,6 @@ if __name__ == '__main__':
         pcd_filter(testlist, args.num_worker)
     else:
         gipuma_filter(testlist, args.outdir, args.prob_threshold, args.disp_threshold, args.num_consistent,
-                      args.fusibile_exe_path)
+                      args.fusibile_exe_path,
+                      get_fusion_depth_folder(),
+                      get_fusion_confidence_folder())

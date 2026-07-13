@@ -9,3 +9,23 @@
   - 增加 --freeze_backbone_epochs，前 6 个 epoch 只训练 Stage3 NormalHead + SGERBlock，之后解冻全模型。
   - 测试导出同时保存 depth_est_raw/、depth_est/，并增加残差校准置信度 confidence_residual_calibrated/；融合时用参数选择 confidence 或校准置信度，便于跑两套点云对比。
   - checkpoint 初始化支持直接从实验 8 checkpoint 加载：SGER Lite 新增参数缺失允许，原 CasMVSNet 权重严格对齐，避免静默吞掉主干不匹配。
+
+   目前：A
+   执行python test.py   --dataset=general_eval   --batch_size=1   --testpath=data/DTU/dtu_test_all   --testlist=lists/dtu/test.txt   --loadckpt=./checkpoints/cas_dtu/model_000012.ckpt
+  --outdir=./outputs   --interval_scale=1.06   --filter_method=gipuma --use_sger_lite时使用的时raw depth 还是 refined depth，原始置信度还是残差校准置信度？
+• 这条命令使用的是：
+  - 深度图保存/主输出：depth_est/ 保存的是 refined depth
+  - 同时额外保存：depth_est_raw/ 保存的是 Stage3 raw depth
+  - Gipuma 融合实际使用的深度：refined depth
+  - Gipuma 融合实际使用的置信度：原始 photometric confidence
+
+  原因是你用了：
+  --filter_method=gipuma
+  当前 gipuma_filter() 走的是 gipuma.py，它固定读取：
+  depth_est/
+  confidence/
+  所以即使你开启了 --use_sger_lite，它会用：
+  - depth_est/：refined depth
+  - confidence/：原始置信度
+
+消融B：refined depth + residual calibrated（精细后的置信度）
