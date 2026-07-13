@@ -69,7 +69,7 @@ parser.add_argument('--save_freq', type=int, default=20, help='save freq of loca
 
 
 parser.add_argument('--filter_method', type=str, default='normal', choices=["gipuma", "normal"], help="filter method")
-parser.add_argument('--fusion_depth_source', type=str, default='refined', choices=["refined", "raw"],
+parser.add_argument('--fusion_depth_source', type=str, default='raw', choices=["refined", "raw"],
                     help='depth folder used by normal point-cloud fusion')
 parser.add_argument('--fusion_confidence_source', type=str, default='raw', choices=["raw", "residual_calibrated"],
                     help='confidence folder used by normal point-cloud fusion')
