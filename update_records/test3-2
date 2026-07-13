@@ -10,6 +10,19 @@
   - 测试导出同时保存 depth_est_raw/、depth_est/，并增加残差校准置信度 confidence_residual_calibrated/；融合时用参数选择 confidence 或校准置信度，便于跑两套点云对比。
   - checkpoint 初始化支持直接从实验 8 checkpoint 加载：SGER Lite 新增参数缺失允许，原 CasMVSNet 权重严格对齐，避免静默吞掉主干不匹配。
 
+
+python test.py \
+    --dataset=general_eval \
+    --batch_size=1 \
+    --testpath=data/DTU/dtu_test_all \
+    --testlist=lists/dtu/test.txt \
+    --loadckpt=./checkpoints/cas_dtu/model_000012.ckpt \
+    --outdir=./outputs \
+    --interval_scale=1.06 \
+    --filter_method=gipuma \
+    --use_sger_lite \
+    --fusion_depth_source refined \
+    --fusion_confidence_source residual_calibrated
    目前：A
    执行python test.py   --dataset=general_eval   --batch_size=1   --testpath=data/DTU/dtu_test_all   --testlist=lists/dtu/test.txt   --loadckpt=./checkpoints/cas_dtu/model_000012.ckpt
   --outdir=./outputs   --interval_scale=1.06   --filter_method=gipuma --use_sger_lite时使用的时raw depth 还是 refined depth，原始置信度还是残差校准置信度？

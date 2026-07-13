@@ -370,6 +370,8 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         assert export_hook in test_source
     assert "depth_folder=\"depth_est\"" in gipuma_source
     assert "confidence_folder=\"confidence\"" in gipuma_source
+    assert "--fusion_depth_source', type=str, default='raw'" in test_source
+    assert "--fusion_confidence_source', type=str, default='raw'" in test_source
     assert "get_fusion_depth_folder()" in test_source
     assert "get_fusion_confidence_folder()" in test_source
 
