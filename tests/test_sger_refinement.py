@@ -324,6 +324,7 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
     root = Path(__file__).resolve().parents[1]
     train_source = (root / "train.py").read_text()
     test_source = (root / "test.py").read_text()
+    gipuma_source = (root / "gipuma.py").read_text()
 
     model_flags = [
         "--use_sger",
@@ -367,6 +368,10 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         "get_fusion_confidence_folder",
     ):
         assert export_hook in test_source
+    assert "depth_folder=\"depth_est\"" in gipuma_source
+    assert "confidence_folder=\"confidence\"" in gipuma_source
+    assert "get_fusion_depth_folder()" in test_source
+    assert "get_fusion_confidence_folder()" in test_source
 
 
 if __name__ == "__main__":
