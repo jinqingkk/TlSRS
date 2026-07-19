@@ -345,7 +345,7 @@ def test_sger_gate_loss_uses_only_valid_pixels():
 
 
 def test_safe_refine_loss_penalizes_only_regressions():
-    raw = torch.tensor([[[2.0, 2.0]]])
+    raw = torch.tensor([[[2.0, 2.0]]], requires_grad=True)
     refined = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
     outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
     depth_gt = {"stage1": torch.ones(1, 1, 2)}
@@ -366,6 +366,10 @@ def test_safe_refine_loss_penalizes_only_regressions():
     assert torch.allclose(
         extra["stage1/safe_refine_loss"], torch.tensor(0.5))
     assert torch.allclose(total, torch.tensor(0.05))
+    total.backward()
+    assert raw.grad is not None
+    assert torch.allclose(raw.grad, torch.zeros_like(raw.grad))
+    assert refined.grad is not None
 
 
 def test_safe_refine_loss_is_zero_for_improvement_and_applies_margin():

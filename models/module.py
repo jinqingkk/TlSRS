@@ -925,7 +925,7 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 safe_refine_loss = masked_mean(
                     F.relu(
                         (depth_est - depth_gt).abs()
-                        - (depth_raw - depth_gt).abs()
+                        - (depth_raw - depth_gt).abs().detach()
                         + safe_refine_margin),
                     mask)
                 total_loss += safe_refine_loss_weight * safe_refine_loss
