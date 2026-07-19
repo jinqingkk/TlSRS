@@ -853,6 +853,9 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     raw_depth_loss_weight = kwargs.get("raw_depth_loss_weight", 0.5)
     refined_depth_loss_weight = kwargs.get("refined_depth_loss_weight", 1.0)
     residual_loss_weight = kwargs.get("residual_loss_weight", 0.001)
+    gate_loss_weight = kwargs.get("gate_loss_weight", 0.0)
+    safe_refine_loss_weight = kwargs.get("safe_refine_loss_weight", 0.0)
+    safe_refine_margin = kwargs.get("safe_refine_margin", 0.0)
     imgs = kwargs.get("imgs", None)
     proj_matrices = kwargs.get("proj_matrices", None)
     normal_smooth_loss_weight = kwargs.get("normal_smooth_loss_weight", 0.0)
@@ -918,6 +921,16 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             refined_abs_error = masked_mean((depth_est - depth_gt).abs(), mask)
             extra["{}/raw_to_refined_error_delta".format(stage_key)] = (
                 raw_abs_error - refined_abs_error).detach()
+            if safe_refine_loss_weight > 0:
+                safe_refine_loss = masked_mean(
+                    F.relu(
+                        (depth_est - depth_gt).abs()
+                        - (depth_raw - depth_gt).abs()
+                        + safe_refine_margin),
+                    mask)
+                total_loss += safe_refine_loss_weight * safe_refine_loss
+                extra["{}/safe_refine_loss".format(stage_key)] = (
+                    safe_refine_loss.detach())
         else:
             stage_depth_loss = refined_depth_loss
 
@@ -927,6 +940,10 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         if "geometry_gate" in stage_inputs:
             extra["{}/geometry_gate_mean".format(stage_key)] = masked_mean(
                 stage_inputs["geometry_gate"], mask).detach()
+            if gate_loss_weight > 0:
+                gate_loss = masked_mean(stage_inputs["geometry_gate"], mask)
+                total_loss += gate_loss_weight * gate_loss
+                extra["{}/gate_loss".format(stage_key)] = gate_loss.detach()
         if "region_a" in stage_inputs:
             extra["{}/region_A_ratio".format(stage_key)] = masked_mean(
                 stage_inputs["region_a"].float(), mask).detach()

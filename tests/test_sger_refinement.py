@@ -320,6 +320,90 @@ def test_sger_loss_regularizes_normalized_gated_residual():
     assert torch.allclose(total, torch.tensor(0.2))
 
 
+def test_sger_gate_loss_uses_only_valid_pixels():
+    depth = torch.zeros(1, 2, 2, requires_grad=True)
+    outputs = {"stage1": {
+        "depth": depth,
+        "geometry_gate": torch.tensor([[[0.2, 0.4], [0.8, 1.0]]]),
+    }}
+    depth_gt = {"stage1": torch.zeros(1, 2, 2)}
+    mask = {"stage1": torch.tensor([[[1.0, 1.0], [0.0, 0.0]]])}
+
+    total, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[1.0],
+        gate_loss_weight=0.5,
+        return_extra=True,
+    ))
+
+    assert torch.allclose(extra["stage1/gate_loss"], torch.tensor(0.3))
+    assert torch.allclose(total, torch.tensor(0.15))
+
+
+def test_safe_refine_loss_penalizes_only_regressions():
+    raw = torch.tensor([[[2.0, 2.0]]])
+    refined = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
+    outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    total, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        safe_refine_loss_weight=0.1,
+        safe_refine_margin=0.0,
+        return_extra=True,
+    ))
+
+    assert torch.allclose(
+        extra["stage1/safe_refine_loss"], torch.tensor(0.5))
+    assert torch.allclose(total, torch.tensor(0.05))
+
+
+def test_safe_refine_loss_is_zero_for_improvement_and_applies_margin():
+    raw = torch.tensor([[[2.0, 2.0]]])
+    refined = torch.tensor([[[1.0, 2.0]]], requires_grad=True)
+    outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    total_zero, _, extra_zero = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        safe_refine_loss_weight=0.1,
+        safe_refine_margin=0.0,
+        return_extra=True,
+    ))
+    total_margin, _, extra_margin = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        safe_refine_loss_weight=0.1,
+        safe_refine_margin=0.2,
+        return_extra=True,
+    ))
+
+    assert torch.allclose(
+        extra_zero["stage1/safe_refine_loss"], torch.tensor(0.0))
+    assert torch.allclose(total_zero, torch.tensor(0.0))
+    assert torch.allclose(
+        extra_margin["stage1/safe_refine_loss"], torch.tensor(0.1))
+    assert torch.allclose(total_margin, torch.tensor(0.01))
+
+
 def test_train_and_test_entrypoints_expose_sger_configuration():
     root = Path(__file__).resolve().parents[1]
     train_source = (root / "train.py").read_text()
@@ -388,5 +472,8 @@ if __name__ == "__main__":
     test_cascade_uses_refined_depth_as_next_stage_sampling_center()
     test_sger_loss_supervises_raw_and_refined_depth_separately()
     test_sger_loss_regularizes_normalized_gated_residual()
+    test_sger_gate_loss_uses_only_valid_pixels()
+    test_safe_refine_loss_penalizes_only_regressions()
+    test_safe_refine_loss_is_zero_for_improvement_and_applies_margin()
     test_train_and_test_entrypoints_expose_sger_configuration()
     print("SGER unit tests: PASS")
