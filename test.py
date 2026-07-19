@@ -73,6 +73,10 @@ parser.add_argument('--fusion_depth_source', type=str, default='raw', choices=["
                     help='depth folder used by normal point-cloud fusion')
 parser.add_argument('--fusion_confidence_source', type=str, default='raw', choices=["raw", "residual_calibrated"],
                     help='confidence folder used by normal point-cloud fusion')
+parser.add_argument('--confidence_residual_alpha', type=float, default=0.25,
+                    help='residual confidence calibration decay strength')
+parser.add_argument('--confidence_residual_floor', type=float, default=0.5,
+                    help='minimum residual calibration scale')
 
 #filter
 parser.add_argument('--conf', type=float, default=0.9, help='prob confidence')
@@ -91,6 +95,10 @@ print("argv:", sys.argv[1:])
 print_args(args)
 if args.use_sger and args.use_sger_lite:
     raise ValueError("--use_sger and --use_sger_lite are mutually exclusive")
+if args.confidence_residual_alpha < 0:
+    raise ValueError("--confidence_residual_alpha must be non-negative")
+if not 0.0 <= args.confidence_residual_floor <= 1.0:
+    raise ValueError("--confidence_residual_floor must be in [0, 1]")
 if args.testpath_single_scene:
     args.testpath = os.path.dirname(args.testpath_single_scene)
 
@@ -119,8 +127,16 @@ def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger, use_sger_l
                 invalid_missing, list(unexpected_keys)))
 
 
-def residual_calibrated_confidence(confidence, residual_ratio):
-    calibrated = confidence * np.exp(-np.maximum(residual_ratio, 0.0))
+def residual_calibrated_confidence(
+        confidence, residual_ratio, alpha=0.25, confidence_floor=0.5):
+    if alpha < 0:
+        raise ValueError("alpha must be non-negative")
+    if not 0.0 <= confidence_floor <= 1.0:
+        raise ValueError("confidence_floor must be in [0, 1]")
+    residual = np.maximum(residual_ratio, 0.0)
+    scale = confidence_floor + (
+        1.0 - confidence_floor) * np.exp(-alpha * residual)
+    calibrated = confidence * scale
     return np.clip(calibrated, 0.0, 1.0).astype(np.float32)
 
 
@@ -299,7 +315,11 @@ def save_scene_depth(testlist):
                 #save confidence maps
                 save_pfm(confidence_filename, photometric_confidence)
                 save_pfm(confidence_calibrated_filename,
-                         residual_calibrated_confidence(photometric_confidence, residual_ratio))
+                         residual_calibrated_confidence(
+                             photometric_confidence,
+                             residual_ratio,
+                             args.confidence_residual_alpha,
+                             args.confidence_residual_floor))
                 #save cams, img
                 write_cam(cam_filename, cam)
                 img = np.clip(np.transpose(img, (1, 2, 0)) * 255, 0, 255).astype(np.uint8)

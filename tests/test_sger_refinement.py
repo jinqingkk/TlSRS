@@ -1,4 +1,5 @@
 import ast
+import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -484,6 +485,52 @@ def test_sger_lite_freeze_only_disables_backbone_parameters():
     assert all(param.requires_grad for param in model.parameters())
 
 
+def _load_test_helper(name):
+    test_path = Path(__file__).resolve().parents[1] / "test.py"
+    tree = ast.parse(test_path.read_text())
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=selected), str(test_path), "exec"), namespace)
+    return namespace[name]
+
+
+def test_residual_calibrated_confidence_uses_soft_floor():
+    calibrate = _load_test_helper("residual_calibrated_confidence")
+    confidence = np.array([0.2, 0.8, 1.2], dtype=np.float32)
+    residual = np.array([0.0, 1.0, 100.0], dtype=np.float32)
+
+    actual = calibrate(
+        confidence, residual, alpha=0.25, confidence_floor=0.5)
+
+    expected_scale = 0.5 + 0.5 * np.exp(-0.25 * residual)
+    expected = np.clip(confidence * expected_scale, 0.0, 1.0)
+    np.testing.assert_allclose(actual, expected.astype(np.float32))
+    assert actual[0] == confidence[0]
+    assert actual[2] >= 0.5 * min(confidence[2], 1.0)
+
+
+def test_residual_calibrated_confidence_rejects_invalid_parameters():
+    calibrate = _load_test_helper("residual_calibrated_confidence")
+
+    for alpha, confidence_floor in ((-0.1, 0.5), (0.25, -0.1),
+                                    (0.25, 1.1)):
+        try:
+            calibrate(
+                np.ones(1, dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+                alpha=alpha,
+                confidence_floor=confidence_floor,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "invalid calibration parameters must raise ValueError")
+
+
 def test_train_and_test_entrypoints_expose_sger_configuration():
     root = Path(__file__).resolve().parents[1]
     train_source = (root / "train.py").read_text()
@@ -543,6 +590,8 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
     assert "confidence_folder=\"confidence\"" in gipuma_source
     assert "--fusion_depth_source', type=str, default='raw'" in test_source
     assert "--fusion_confidence_source', type=str, default='raw'" in test_source
+    assert "--confidence_residual_alpha', type=float, default=0.25" in test_source
+    assert "--confidence_residual_floor', type=float, default=0.5" in test_source
     assert "get_fusion_depth_folder()" in test_source
     assert "get_fusion_confidence_folder()" in test_source
 
@@ -565,5 +614,7 @@ if __name__ == "__main__":
     test_sger_lite_optimizer_groups_cover_parameters_once()
     test_non_lite_optimizer_group_keeps_base_learning_rate()
     test_sger_lite_freeze_only_disables_backbone_parameters()
+    test_residual_calibrated_confidence_uses_soft_floor()
+    test_residual_calibrated_confidence_rejects_invalid_parameters()
     test_train_and_test_entrypoints_expose_sger_configuration()
     print("SGER unit tests: PASS")
