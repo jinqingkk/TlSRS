@@ -40,5 +40,6 @@ python test.py \
   所以即使你开启了 --use_sger_lite，它会用：
   - depth_est/：refined depth
   - confidence/：原始置信度
-
+消融a：refined depth + raw photometric
 消融B：refined depth + residual calibrated（精细后的置信度）
+消融c:row depth + 原始 confidence

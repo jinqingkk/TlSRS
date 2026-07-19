@@ -1,3 +1,5 @@
+import ast
+import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -320,6 +322,219 @@ def test_sger_loss_regularizes_normalized_gated_residual():
     assert torch.allclose(total, torch.tensor(0.2))
 
 
+def test_sger_gate_loss_uses_only_valid_pixels():
+    depth = torch.zeros(1, 2, 2, requires_grad=True)
+    outputs = {"stage1": {
+        "depth": depth,
+        "geometry_gate": torch.tensor([[[0.2, 0.4], [0.8, 1.0]]]),
+    }}
+    depth_gt = {"stage1": torch.zeros(1, 2, 2)}
+    mask = {"stage1": torch.tensor([[[1.0, 1.0], [0.0, 0.0]]])}
+
+    total, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[1.0],
+        gate_loss_weight=0.5,
+        return_extra=True,
+    ))
+
+    assert torch.allclose(extra["stage1/gate_loss"], torch.tensor(0.3))
+    assert torch.allclose(total, torch.tensor(0.15))
+
+
+def test_safe_refine_loss_penalizes_only_regressions():
+    raw = torch.tensor([[[2.0, 2.0]]], requires_grad=True)
+    refined = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
+    outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    total, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        safe_refine_loss_weight=0.1,
+        safe_refine_margin=0.0,
+        return_extra=True,
+    ))
+
+    assert torch.allclose(
+        extra["stage1/safe_refine_loss"], torch.tensor(0.5))
+    assert torch.allclose(total, torch.tensor(0.05))
+    total.backward()
+    assert raw.grad is not None
+    assert torch.allclose(raw.grad, torch.zeros_like(raw.grad))
+    assert refined.grad is not None
+
+
+def test_safe_refine_loss_is_zero_for_improvement_and_applies_margin():
+    raw = torch.tensor([[[2.0, 2.0]]])
+    refined = torch.tensor([[[1.0, 2.0]]], requires_grad=True)
+    outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    total_zero, _, extra_zero = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        safe_refine_loss_weight=0.1,
+        safe_refine_margin=0.0,
+        return_extra=True,
+    ))
+    total_margin, _, extra_margin = _unpack_loss(cas_mvsnet_loss(
+        outputs,
+        depth_gt,
+        mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        safe_refine_loss_weight=0.1,
+        safe_refine_margin=0.2,
+        return_extra=True,
+    ))
+
+    assert torch.allclose(
+        extra_zero["stage1/safe_refine_loss"], torch.tensor(0.0))
+    assert torch.allclose(total_zero, torch.tensor(0.0))
+    assert torch.allclose(
+        extra_margin["stage1/safe_refine_loss"], torch.tensor(0.1))
+    assert torch.allclose(total_margin, torch.tensor(0.01))
+
+
+def _load_train_helpers(*names):
+    train_path = Path(__file__).resolve().parents[1] / "train.py"
+    tree = ast.parse(train_path.read_text())
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace = {}
+    exec(compile(ast.Module(body=selected), str(train_path), "exec"), namespace)
+    return [namespace[name] for name in names]
+
+
+def test_sger_lite_optimizer_groups_cover_parameters_once():
+    _, build_optimizer_param_groups = _load_train_helpers(
+        "is_sger_lite_parameter", "build_optimizer_param_groups")
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+    )
+
+    groups = build_optimizer_param_groups(
+        model, base_lr=0.001, backbone_lr_scale=0.1)
+
+    assert [group["lr"] for group in groups] == [0.001, 0.0001]
+    grouped = [id(param) for group in groups for param in group["params"]]
+    assert len(grouped) == len(set(grouped))
+    assert set(grouped) == {id(param) for param in model.parameters()}
+
+    names_by_id = {id(param): name for name, param in model.named_parameters()}
+    sger_names = {names_by_id[id(param)] for param in groups[0]["params"]}
+    backbone_names = {names_by_id[id(param)] for param in groups[1]["params"]}
+    assert any(name.startswith("normal_head.2.") for name in sger_names)
+    assert any(name.startswith("sger_blocks.") for name in sger_names)
+    assert any(name.startswith("feature.") for name in backbone_names)
+
+
+def test_non_lite_optimizer_group_keeps_base_learning_rate():
+    _, build_optimizer_param_groups = _load_train_helpers(
+        "is_sger_lite_parameter", "build_optimizer_param_groups")
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=False,
+    )
+
+    groups = build_optimizer_param_groups(
+        model, base_lr=0.001, backbone_lr_scale=0.1)
+
+    assert len(groups) == 1
+    assert groups[0]["lr"] == 0.001
+    assert {id(param) for param in groups[0]["params"]} == {
+        id(param) for param in model.parameters()}
+
+
+def test_sger_lite_freeze_only_disables_backbone_parameters():
+    _, _, set_sger_lite_freeze = _load_train_helpers(
+        "is_sger_lite_parameter",
+        "build_optimizer_param_groups",
+        "set_sger_lite_freeze",
+    )
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+    )
+
+    set_sger_lite_freeze(model, True)
+
+    for name, param in model.named_parameters():
+        expected_trainable = (
+            name.startswith("normal_head.2.")
+            or name.startswith("sger_blocks."))
+        assert param.requires_grad == expected_trainable
+
+    set_sger_lite_freeze(model, False)
+    assert all(param.requires_grad for param in model.parameters())
+
+
+def _load_test_helper(name):
+    test_path = Path(__file__).resolve().parents[1] / "test.py"
+    tree = ast.parse(test_path.read_text())
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=selected), str(test_path), "exec"), namespace)
+    return namespace[name]
+
+
+def test_residual_calibrated_confidence_uses_soft_floor():
+    calibrate = _load_test_helper("residual_calibrated_confidence")
+    confidence = np.array([0.2, 0.8, 1.2], dtype=np.float32)
+    residual = np.array([0.0, 1.0, 100.0], dtype=np.float32)
+
+    actual = calibrate(
+        confidence, residual, alpha=0.25, confidence_floor=0.5)
+
+    expected_scale = 0.5 + 0.5 * np.exp(-0.25 * residual)
+    expected = np.clip(confidence * expected_scale, 0.0, 1.0)
+    np.testing.assert_allclose(actual, expected.astype(np.float32))
+    assert actual[0] == confidence[0]
+    assert actual[2] >= 0.5 * min(confidence[2], 1.0)
+
+
+def test_residual_calibrated_confidence_rejects_invalid_parameters():
+    calibrate = _load_test_helper("residual_calibrated_confidence")
+
+    for alpha, confidence_floor in ((-0.1, 0.5), (0.25, -0.1),
+                                    (0.25, 1.1)):
+        try:
+            calibrate(
+                np.ones(1, dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+                alpha=alpha,
+                confidence_floor=confidence_floor,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "invalid calibration parameters must raise ValueError")
+
+
 def test_train_and_test_entrypoints_expose_sger_configuration():
     root = Path(__file__).resolve().parents[1]
     train_source = (root / "train.py").read_text()
@@ -351,12 +566,19 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         assert 'image_outputs["{}"]'.format(image_key) in train_source
     for source in (train_source, test_source):
         assert "--use_sger_lite" in source
-        assert "--sger_max_residual_ratio', type=float, default=0.5" in source
+        assert "--sger_max_residual_ratio', type=float, default=0.25" in source
     for flag in (
-        "--freeze_backbone_epochs",
+        "--freeze_backbone_epochs', type=int, default=8",
         "--raw_depth_loss_weight', type=float, default=1.0",
         "--refined_depth_loss_weight', type=float, default=1.0",
-        "--residual_loss_weight', type=float, default=0.005",
+        "--residual_loss_weight', type=float, default=0.01",
+        "--gate_loss_weight', type=float, default=0.001",
+        "--safe_refine_loss_weight', type=float, default=0.1",
+        "--safe_refine_margin', type=float, default=0.0",
+        "--backbone_lr_scale', type=float, default=0.1",
+        '"gate_loss_weight": args.gate_loss_weight',
+        '"safe_refine_loss_weight": args.safe_refine_loss_weight',
+        '"safe_refine_margin": args.safe_refine_margin',
     ):
         assert flag in train_source
     for export_hook in (
@@ -372,6 +594,8 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
     assert "confidence_folder=\"confidence\"" in gipuma_source
     assert "--fusion_depth_source', type=str, default='raw'" in test_source
     assert "--fusion_confidence_source', type=str, default='raw'" in test_source
+    assert "--confidence_residual_alpha', type=float, default=0.25" in test_source
+    assert "--confidence_residual_floor', type=float, default=0.5" in test_source
     assert "get_fusion_depth_folder()" in test_source
     assert "get_fusion_confidence_folder()" in test_source
 
@@ -388,5 +612,13 @@ if __name__ == "__main__":
     test_cascade_uses_refined_depth_as_next_stage_sampling_center()
     test_sger_loss_supervises_raw_and_refined_depth_separately()
     test_sger_loss_regularizes_normalized_gated_residual()
+    test_sger_gate_loss_uses_only_valid_pixels()
+    test_safe_refine_loss_penalizes_only_regressions()
+    test_safe_refine_loss_is_zero_for_improvement_and_applies_margin()
+    test_sger_lite_optimizer_groups_cover_parameters_once()
+    test_non_lite_optimizer_group_keeps_base_learning_rate()
+    test_sger_lite_freeze_only_disables_backbone_parameters()
+    test_residual_calibrated_confidence_uses_soft_floor()
+    test_residual_calibrated_confidence_rejects_invalid_parameters()
     test_train_and_test_entrypoints_expose_sger_configuration()
     print("SGER unit tests: PASS")

@@ -77,13 +77,17 @@ parser.add_argument('--sger_share', action='store_true', help='share the SGER co
 parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
-parser.add_argument('--sger_max_residual_ratio', type=float, default=0.5, help='maximum residual in stage depth intervals')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--raw_depth_loss_weight', type=float, default=1.0, help='auxiliary raw stage depth loss weight')
 parser.add_argument('--refined_depth_loss_weight', type=float, default=1.0, help='refined stage depth loss weight')
-parser.add_argument('--residual_loss_weight', type=float, default=0.005, help='normalized SGER residual regularization weight')
-parser.add_argument('--freeze_backbone_epochs', type=int, default=0, help='freeze non-SGER-Lite backbone for the first N epochs')
+parser.add_argument('--residual_loss_weight', type=float, default=0.01, help='normalized SGER residual regularization weight')
+parser.add_argument('--gate_loss_weight', type=float, default=0.001, help='SGER geometry gate sparsity loss weight')
+parser.add_argument('--safe_refine_loss_weight', type=float, default=0.1, help='penalty when refined depth is worse than raw depth')
+parser.add_argument('--safe_refine_margin', type=float, default=0.0, help='raw-to-refined safety loss margin')
+parser.add_argument('--freeze_backbone_epochs', type=int, default=8, help='freeze non-SGER-Lite backbone for the first N epochs')
+parser.add_argument('--backbone_lr_scale', type=float, default=0.1, help='SGER-Lite backbone learning-rate multiplier after unfreezing')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -104,6 +108,9 @@ def loss_kwargs(sample_cuda, args):
         "raw_depth_loss_weight": args.raw_depth_loss_weight,
         "refined_depth_loss_weight": args.refined_depth_loss_weight,
         "residual_loss_weight": args.residual_loss_weight,
+        "gate_loss_weight": args.gate_loss_weight,
+        "safe_refine_loss_weight": args.safe_refine_loss_weight,
+        "safe_refine_margin": args.safe_refine_margin,
         "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
         "curv_loss_weight": args.curv_loss_weight,
         "edge_smooth_loss_weight": args.edge_smooth_loss_weight,
@@ -145,18 +152,51 @@ def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger, use_sger_l
                 invalid_missing, list(unexpected_keys)))
 
 
-def set_sger_lite_freeze(model, freeze_backbone):
-    module = model.module if hasattr(model, "module") else model
-    if not getattr(module, "use_sger_lite", False):
-        return
+def is_sger_lite_parameter(module, name):
     trainable_prefixes = (
         "normal_head.{}.".format(module.num_stage - 1),
         "sger_blocks.",
         "shared_sger.",
         "sger_feature_adapters.{}.".format(module.num_stage - 1),
     )
+    return name.startswith(trainable_prefixes)
+
+
+def build_optimizer_param_groups(model, base_lr, backbone_lr_scale):
+    module = model.module if hasattr(model, "module") else model
+    if not getattr(module, "use_sger_lite", False):
+        return [{
+            "params": list(module.parameters()),
+            "lr": base_lr,
+            "name": "model",
+        }]
+    if not 0.0 < backbone_lr_scale <= 1.0:
+        raise ValueError("backbone_lr_scale must be in (0, 1]")
+
+    sger_params = []
+    backbone_params = []
     for name, param in module.named_parameters():
-        param.requires_grad = (not freeze_backbone) or name.startswith(trainable_prefixes)
+        if is_sger_lite_parameter(module, name):
+            sger_params.append(param)
+        else:
+            backbone_params.append(param)
+    return [
+        {"params": sger_params, "lr": base_lr, "name": "sger_lite"},
+        {
+            "params": backbone_params,
+            "lr": base_lr * backbone_lr_scale,
+            "name": "backbone",
+        },
+    ]
+
+
+def set_sger_lite_freeze(model, freeze_backbone):
+    module = model.module if hasattr(model, "module") else model
+    if not getattr(module, "use_sger_lite", False):
+        return
+    for name, param in module.named_parameters():
+        param.requires_grad = (
+            (not freeze_backbone) or is_sger_lite_parameter(module, name))
 
 
 # main function
@@ -185,10 +225,14 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
                 if do_summary:
                     save_scalars(logger, 'train', scalar_outputs, global_step)
                     save_images(logger, 'train', image_outputs, global_step)
+                    lr_text = ",".join(
+                        "{}={:.6f}".format(
+                            group.get("name", index), group["lr"])
+                        for index, group in enumerate(optimizer.param_groups))
                     print(
-                       "Epoch {}/{}, Iter {}/{}, lr {:.6f}, train loss = {:.3f}, depth loss = {:.3f}, time = {:.3f}".format(
+                       "Epoch {}/{}, Iter {}/{}, lr {}, train loss = {:.3f}, depth loss = {:.3f}, time = {:.3f}".format(
                            epoch_idx, args.epochs, batch_idx, len(TrainImgLoader),
-                           optimizer.param_groups[0]["lr"], loss,
+                           lr_text, loss,
                            scalar_outputs['depth_loss'],
                            time.time() - start_time))
                 del scalar_outputs, image_outputs
@@ -479,7 +523,11 @@ if __name__ == '__main__':
         print("using apex synced BN")
         model = apex.parallel.convert_syncbn_model(model)
 
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.wd)
+    optimizer_groups = build_optimizer_param_groups(
+        model, args.lr, args.backbone_lr_scale)
+    optimizer = optim.Adam(
+        optimizer_groups, lr=args.lr, betas=(0.9, 0.999),
+        weight_decay=args.wd)
 
     # load parameters
     start_epoch = 0
