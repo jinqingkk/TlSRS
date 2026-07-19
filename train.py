@@ -77,13 +77,16 @@ parser.add_argument('--sger_share', action='store_true', help='share the SGER co
 parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
-parser.add_argument('--sger_max_residual_ratio', type=float, default=0.5, help='maximum residual in stage depth intervals')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--raw_depth_loss_weight', type=float, default=1.0, help='auxiliary raw stage depth loss weight')
 parser.add_argument('--refined_depth_loss_weight', type=float, default=1.0, help='refined stage depth loss weight')
-parser.add_argument('--residual_loss_weight', type=float, default=0.005, help='normalized SGER residual regularization weight')
-parser.add_argument('--freeze_backbone_epochs', type=int, default=0, help='freeze non-SGER-Lite backbone for the first N epochs')
+parser.add_argument('--residual_loss_weight', type=float, default=0.01, help='normalized SGER residual regularization weight')
+parser.add_argument('--gate_loss_weight', type=float, default=0.001, help='SGER geometry gate sparsity loss weight')
+parser.add_argument('--safe_refine_loss_weight', type=float, default=0.1, help='penalty when refined depth is worse than raw depth')
+parser.add_argument('--safe_refine_margin', type=float, default=0.0, help='raw-to-refined safety loss margin')
+parser.add_argument('--freeze_backbone_epochs', type=int, default=8, help='freeze non-SGER-Lite backbone for the first N epochs')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -104,6 +107,9 @@ def loss_kwargs(sample_cuda, args):
         "raw_depth_loss_weight": args.raw_depth_loss_weight,
         "refined_depth_loss_weight": args.refined_depth_loss_weight,
         "residual_loss_weight": args.residual_loss_weight,
+        "gate_loss_weight": args.gate_loss_weight,
+        "safe_refine_loss_weight": args.safe_refine_loss_weight,
+        "safe_refine_margin": args.safe_refine_margin,
         "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
         "curv_loss_weight": args.curv_loss_weight,
         "edge_smooth_loss_weight": args.edge_smooth_loss_weight,

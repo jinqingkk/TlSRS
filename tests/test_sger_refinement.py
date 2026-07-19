@@ -435,12 +435,18 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         assert 'image_outputs["{}"]'.format(image_key) in train_source
     for source in (train_source, test_source):
         assert "--use_sger_lite" in source
-        assert "--sger_max_residual_ratio', type=float, default=0.5" in source
+        assert "--sger_max_residual_ratio', type=float, default=0.25" in source
     for flag in (
-        "--freeze_backbone_epochs",
+        "--freeze_backbone_epochs', type=int, default=8",
         "--raw_depth_loss_weight', type=float, default=1.0",
         "--refined_depth_loss_weight', type=float, default=1.0",
-        "--residual_loss_weight', type=float, default=0.005",
+        "--residual_loss_weight', type=float, default=0.01",
+        "--gate_loss_weight', type=float, default=0.001",
+        "--safe_refine_loss_weight', type=float, default=0.1",
+        "--safe_refine_margin', type=float, default=0.0",
+        '"gate_loss_weight": args.gate_loss_weight',
+        '"safe_refine_loss_weight": args.safe_refine_loss_weight',
+        '"safe_refine_margin": args.safe_refine_margin',
     ):
         assert flag in train_source
     for export_hook in (

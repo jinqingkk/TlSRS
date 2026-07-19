@@ -47,7 +47,7 @@ parser.add_argument('--sger_share', action='store_true', help='share the SGER co
 parser.add_argument('--sger_feature_channels', type=int, default=8, help='projected reference feature channels for SGER')
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
-parser.add_argument('--sger_max_residual_ratio', type=float, default=0.5, help='maximum residual in stage depth intervals')
+parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--allow_legacy_checkpoint', action='store_true', help='allow loading a checkpoint without SGER parameters')
