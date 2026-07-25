@@ -165,6 +165,64 @@ def test_cascade_sger_lite_refines_stage3_only():
     assert torch.allclose(outputs["depth_refined"], stage3["depth_refined"])
 
 
+def test_cascade_sger_lite_scales_effective_residual():
+    torch.manual_seed(6)
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+        sger_hidden_channels=16,
+        sger_gate_channels=8,
+    )
+    model.eval()
+    with torch.no_grad():
+        model.sger_blocks[0].residual.output.bias.fill_(0.2)
+    imgs = torch.rand(1, 3, 3, 32, 32)
+    depth_values = torch.linspace(1.0, 2.0, 8).view(1, 8)
+    proj_matrices = {
+        key: _identity_proj(1, 3)
+        for key in ("stage1", "stage2", "stage3")
+    }
+
+    with torch.no_grad():
+        model.set_sger_residual_scale(0.0)
+        scale_zero = model(imgs, proj_matrices, depth_values)
+        model.set_sger_residual_scale(0.5)
+        scale_half = model(imgs, proj_matrices, depth_values)
+        model.set_sger_residual_scale(1.0)
+        scale_full = model(imgs, proj_matrices, depth_values)
+
+    assert torch.allclose(
+        scale_zero["depth_refined"], scale_zero["depth_raw"])
+    assert torch.all(scale_zero["depth_residual"] == 0)
+    assert torch.allclose(
+        scale_half["depth_residual"],
+        0.5 * scale_full["depth_residual"],
+        atol=1e-7)
+    assert torch.allclose(
+        scale_half["depth_refined"],
+        scale_half["depth_raw"] + scale_half["depth_residual"])
+    assert scale_half["sger_residual_scale"].item() == 0.5
+    assert "sger_residual_scale" not in model.state_dict()
+
+
+def test_cascade_sger_residual_scale_rejects_invalid_values():
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+    )
+    assert model.sger_residual_scale == 1.0
+
+    for scale in (-0.1, 1.1, float("nan"), float("inf")):
+        try:
+            model.set_sger_residual_scale(scale)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid residual scale must raise ValueError")
+
+
 def test_cascade_disabled_path_has_no_sger_only_outputs():
     model = CascadeMVSNet(
         ndepths=[8, 8, 8],
@@ -634,6 +692,8 @@ if __name__ == "__main__":
     test_sger_refined_depth_backpropagates_through_learned_path()
     test_cascade_sger_returns_raw_and_refined_depth_for_every_stage()
     test_cascade_sger_lite_refines_stage3_only()
+    test_cascade_sger_lite_scales_effective_residual()
+    test_cascade_sger_residual_scale_rejects_invalid_values()
     test_cascade_disabled_path_has_no_sger_only_outputs()
     test_cascade_shared_sger_mode_runs_all_stages()
     test_cascade_uses_refined_depth_as_next_stage_sampling_center()
