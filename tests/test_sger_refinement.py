@@ -447,6 +447,33 @@ def test_sger_lite_optimizer_groups_cover_parameters_once():
     assert any(name.startswith("feature.") for name in backbone_names)
 
 
+def test_sger_warmup_schedule_matches_experiment13_epochs():
+    compute_sger_warmup_scale, = _load_train_helpers(
+        "compute_sger_warmup_scale")
+
+    actual = [
+        compute_sger_warmup_scale(epoch, 3, 6)
+        for epoch in range(8)
+    ]
+
+    assert actual == [0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0]
+    assert compute_sger_warmup_scale(2, 3, 3) == 0.0
+    assert compute_sger_warmup_scale(3, 3, 3) == 1.0
+
+
+def test_sger_warmup_schedule_rejects_invalid_epoch_ranges():
+    compute_sger_warmup_scale, = _load_train_helpers(
+        "compute_sger_warmup_scale")
+
+    for start_epoch, end_epoch in ((-1, 6), (3, -1), (6, 3)):
+        try:
+            compute_sger_warmup_scale(0, start_epoch, end_epoch)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid warm-up epochs must raise ValueError")
+
+
 def test_non_lite_optimizer_group_keeps_base_learning_rate():
     _, build_optimizer_param_groups = _load_train_helpers(
         "is_sger_lite_parameter", "build_optimizer_param_groups")
@@ -616,6 +643,8 @@ if __name__ == "__main__":
     test_safe_refine_loss_penalizes_only_regressions()
     test_safe_refine_loss_is_zero_for_improvement_and_applies_margin()
     test_sger_lite_optimizer_groups_cover_parameters_once()
+    test_sger_warmup_schedule_matches_experiment13_epochs()
+    test_sger_warmup_schedule_rejects_invalid_epoch_ranges()
     test_non_lite_optimizer_group_keeps_base_learning_rate()
     test_sger_lite_freeze_only_disables_backbone_parameters()
     test_residual_calibrated_confidence_uses_soft_floor()

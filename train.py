@@ -88,6 +88,8 @@ parser.add_argument('--safe_refine_loss_weight', type=float, default=0.1, help='
 parser.add_argument('--safe_refine_margin', type=float, default=0.0, help='raw-to-refined safety loss margin')
 parser.add_argument('--freeze_backbone_epochs', type=int, default=8, help='freeze non-SGER-Lite backbone for the first N epochs')
 parser.add_argument('--backbone_lr_scale', type=float, default=0.1, help='SGER-Lite backbone learning-rate multiplier after unfreezing')
+parser.add_argument('--sger_warmup_start_epoch', type=int, default=3, help='first epoch with a nonzero SGER residual scale')
+parser.add_argument('--sger_warmup_end_epoch', type=int, default=6, help='first epoch with the full SGER residual scale')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -150,6 +152,19 @@ def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger, use_sger_l
             "checkpoint is incompatible with SGER initialization; "
             "unrelated missing keys: {}; unexpected keys: {}".format(
                 invalid_missing, list(unexpected_keys)))
+
+
+def compute_sger_warmup_scale(epoch_idx, start_epoch, end_epoch):
+    if start_epoch < 0 or end_epoch < 0:
+        raise ValueError("SGER warm-up epochs must be non-negative")
+    if end_epoch < start_epoch:
+        raise ValueError("SGER warm-up end must be >= start")
+    if epoch_idx < start_epoch:
+        return 0.0
+    if epoch_idx >= end_epoch:
+        return 1.0
+    return float(epoch_idx - start_epoch + 1) / float(
+        end_epoch - start_epoch + 1)
 
 
 def is_sger_lite_parameter(module, name):
