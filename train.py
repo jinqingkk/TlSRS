@@ -113,6 +113,7 @@ def loss_kwargs(sample_cuda, args):
         "gate_loss_weight": args.gate_loss_weight,
         "safe_refine_loss_weight": args.safe_refine_loss_weight,
         "safe_refine_margin": args.safe_refine_margin,
+        "sger_loss_scale": getattr(args, "current_sger_warmup_scale", 1.0),
         "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
         "curv_loss_weight": args.curv_loss_weight,
         "edge_smooth_loss_weight": args.edge_smooth_loss_weight,

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 import time
 import sys
 sys.path.append("..")
@@ -856,6 +857,15 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     gate_loss_weight = kwargs.get("gate_loss_weight", 0.0)
     safe_refine_loss_weight = kwargs.get("safe_refine_loss_weight", 0.0)
     safe_refine_margin = kwargs.get("safe_refine_margin", 0.0)
+    sger_loss_scale = float(kwargs.get("sger_loss_scale", 1.0))
+    if not math.isfinite(sger_loss_scale) or not 0.0 <= sger_loss_scale <= 1.0:
+        raise ValueError("sger_loss_scale must be finite and within [0, 1]")
+    effective_refined_depth_loss_weight = (
+        sger_loss_scale * refined_depth_loss_weight)
+    effective_residual_loss_weight = sger_loss_scale * residual_loss_weight
+    effective_gate_loss_weight = sger_loss_scale * gate_loss_weight
+    effective_safe_refine_loss_weight = (
+        sger_loss_scale * safe_refine_loss_weight)
     imgs = kwargs.get("imgs", None)
     proj_matrices = kwargs.get("proj_matrices", None)
     normal_smooth_loss_weight = kwargs.get("normal_smooth_loss_weight", 0.0)
@@ -910,10 +920,20 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             depth_est[mask], depth_gt[mask], reduction='mean')
         depth_loss = refined_depth_loss
         if depth_raw is not None:
+            extra["sger_residual_scale"] = total_loss.new_tensor(
+                sger_loss_scale)
+            extra["effective_refined_depth_loss_weight"] = (
+                total_loss.new_tensor(effective_refined_depth_loss_weight))
+            extra["effective_residual_loss_weight"] = total_loss.new_tensor(
+                effective_residual_loss_weight)
+            extra["effective_gate_loss_weight"] = total_loss.new_tensor(
+                effective_gate_loss_weight)
+            extra["effective_safe_refine_loss_weight"] = (
+                total_loss.new_tensor(effective_safe_refine_loss_weight))
             raw_depth_loss = F.smooth_l1_loss(
                 depth_raw[mask], depth_gt[mask], reduction='mean')
             stage_depth_loss = (
-                refined_depth_loss_weight * refined_depth_loss
+                effective_refined_depth_loss_weight * refined_depth_loss
                 + raw_depth_loss_weight * raw_depth_loss)
             extra["{}/raw_depth_loss".format(stage_key)] = raw_depth_loss.detach()
             extra["{}/refined_depth_loss".format(stage_key)] = refined_depth_loss.detach()
@@ -921,14 +941,20 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             refined_abs_error = masked_mean((depth_est - depth_gt).abs(), mask)
             extra["{}/raw_to_refined_error_delta".format(stage_key)] = (
                 raw_abs_error - refined_abs_error).detach()
-            if safe_refine_loss_weight > 0:
+            improved = (
+                (depth_est - depth_gt).abs()
+                < (depth_raw - depth_gt).abs())
+            extra["{}/refined_improved_pixel_ratio".format(stage_key)] = (
+                masked_mean(improved.float(), mask).detach())
+            if effective_safe_refine_loss_weight > 0:
                 safe_refine_loss = masked_mean(
                     F.relu(
                         (depth_est - depth_gt).abs()
                         - (depth_raw - depth_gt).abs().detach()
                         + safe_refine_margin),
                     mask)
-                total_loss += safe_refine_loss_weight * safe_refine_loss
+                total_loss += (
+                    effective_safe_refine_loss_weight * safe_refine_loss)
                 extra["{}/safe_refine_loss".format(stage_key)] = (
                     safe_refine_loss.detach())
         else:
@@ -940,9 +966,9 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         if "geometry_gate" in stage_inputs:
             extra["{}/geometry_gate_mean".format(stage_key)] = masked_mean(
                 stage_inputs["geometry_gate"], mask).detach()
-            if gate_loss_weight > 0:
+            if effective_gate_loss_weight > 0:
                 gate_loss = masked_mean(stage_inputs["geometry_gate"], mask)
-                total_loss += gate_loss_weight * gate_loss
+                total_loss += effective_gate_loss_weight * gate_loss
                 extra["{}/gate_loss".format(stage_key)] = gate_loss.detach()
         if "region_a" in stage_inputs:
             extra["{}/region_A_ratio".format(stage_key)] = masked_mean(
@@ -1039,9 +1065,12 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             edge_aware_smooth_loss_final = edge_aware_smooth_loss(depth_est, imgs[:, 0], mask)
             total_loss += (edge_smooth_loss_weight/pow(2, stage_idx)) * edge_aware_smooth_loss_final
             extra["edge_smooth_loss"] = edge_aware_smooth_loss_final.detach()
-        if residual_loss_weight > 0 and "residual_ratio" in stage_inputs:
+        if (effective_residual_loss_weight > 0
+                and "residual_ratio" in stage_inputs):
             residual_loss = masked_mean(stage_inputs["residual_ratio"], mask)
-            total_loss += (residual_loss_weight / pow(2, stage_idx)) * residual_loss
+            total_loss += (
+                effective_residual_loss_weight / pow(2, stage_idx)
+            ) * residual_loss
             extra["{}/residual_loss".format(stage_key)] = residual_loss.detach()
         if (depth_normal_loss_weight > 0 and imgs is not None and proj_matrices is not None
                 and stage_key in proj_matrices

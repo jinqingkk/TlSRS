@@ -468,6 +468,82 @@ def test_safe_refine_loss_is_zero_for_improvement_and_applies_margin():
     assert torch.allclose(total_margin, torch.tensor(0.01))
 
 
+def test_sger_loss_scale_warms_all_refinement_terms():
+    raw = torch.full((1, 1, 2), 2.0, requires_grad=True)
+    refined = torch.full((1, 1, 2), 3.0, requires_grad=True)
+    outputs = {"stage1": {
+        "depth": refined,
+        "depth_raw": raw,
+        "residual_ratio": torch.full((1, 1, 2), 2.0),
+        "geometry_gate": torch.full((1, 1, 2), 0.5),
+    }}
+    depth_gt = {"stage1": torch.zeros(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    totals = []
+    extras = []
+    for scale in (0.0, 0.5, 1.0):
+        total, _, extra = _unpack_loss(cas_mvsnet_loss(
+            outputs,
+            depth_gt,
+            mask,
+            dlossw=[1.0],
+            raw_depth_loss_weight=1.0,
+            refined_depth_loss_weight=1.0,
+            residual_loss_weight=0.1,
+            gate_loss_weight=0.2,
+            safe_refine_loss_weight=0.3,
+            sger_loss_scale=scale,
+            return_extra=True,
+        ))
+        totals.append(total)
+        extras.append(extra)
+
+    assert torch.allclose(totals[0], torch.tensor(1.5))
+    assert torch.allclose(totals[1], torch.tensor(3.05))
+    assert torch.allclose(totals[2], torch.tensor(4.6))
+    expected_metrics = {
+        "sger_residual_scale": 0.5,
+        "effective_refined_depth_loss_weight": 0.5,
+        "effective_residual_loss_weight": 0.05,
+        "effective_gate_loss_weight": 0.1,
+        "effective_safe_refine_loss_weight": 0.15,
+    }
+    for key, expected in expected_metrics.items():
+        assert torch.allclose(extras[1][key], torch.tensor(expected))
+
+
+def test_sger_loss_scale_logs_refined_improved_pixel_ratio():
+    raw = torch.tensor([[[2.0, 2.0]]])
+    refined = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
+    outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    _, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs, depth_gt, mask, dlossw=[1.0], return_extra=True))
+
+    assert torch.allclose(
+        extra["stage1/refined_improved_pixel_ratio"], torch.tensor(0.5))
+
+
+def test_sger_loss_scale_rejects_invalid_values():
+    depth = torch.zeros(1, 1, 1, requires_grad=True)
+    outputs = {"stage1": {"depth": depth}}
+    depth_gt = {"stage1": torch.zeros(1, 1, 1)}
+    mask = {"stage1": torch.ones(1, 1, 1)}
+
+    for scale in (-0.1, 1.1, float("nan"), float("inf")):
+        try:
+            cas_mvsnet_loss(
+                outputs, depth_gt, mask,
+                sger_loss_scale=scale, return_extra=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid SGER loss scale must raise ValueError")
+
+
 def _load_train_helpers(*names):
     train_path = Path(__file__).resolve().parents[1] / "train.py"
     tree = ast.parse(train_path.read_text())
@@ -702,6 +778,9 @@ if __name__ == "__main__":
     test_sger_gate_loss_uses_only_valid_pixels()
     test_safe_refine_loss_penalizes_only_regressions()
     test_safe_refine_loss_is_zero_for_improvement_and_applies_margin()
+    test_sger_loss_scale_warms_all_refinement_terms()
+    test_sger_loss_scale_logs_refined_improved_pixel_ratio()
+    test_sger_loss_scale_rejects_invalid_values()
     test_sger_lite_optimizer_groups_cover_parameters_once()
     test_sger_warmup_schedule_matches_experiment13_epochs()
     test_sger_warmup_schedule_rejects_invalid_epoch_ranges()
