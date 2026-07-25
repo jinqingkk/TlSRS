@@ -747,6 +747,38 @@ def test_residual_calibrated_confidence_rejects_invalid_parameters():
                 "invalid calibration parameters must raise ValueError")
 
 
+def test_resume_accepts_matching_or_legacy_sger_warmup_metadata():
+    validate, = _load_train_helpers("validate_sger_warmup_checkpoint")
+
+    class Args:
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    validate({}, Args())
+    validate({
+        "sger_warmup_start_epoch": 3,
+        "sger_warmup_end_epoch": 6,
+    }, Args())
+
+
+def test_resume_rejects_mismatched_sger_warmup_metadata():
+    validate, = _load_train_helpers("validate_sger_warmup_checkpoint")
+
+    class Args:
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    try:
+        validate({
+            "sger_warmup_start_epoch": 2,
+            "sger_warmup_end_epoch": 6,
+        }, Args())
+    except RuntimeError as error:
+        assert "warm-up configuration mismatch" in str(error)
+    else:
+        raise AssertionError("resume must reject a changed warm-up schedule")
+
+
 def test_train_and_test_entrypoints_expose_sger_configuration():
     root = Path(__file__).resolve().parents[1]
     train_source = (root / "train.py").read_text()
@@ -791,6 +823,10 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         '"gate_loss_weight": args.gate_loss_weight',
         '"safe_refine_loss_weight": args.safe_refine_loss_weight',
         '"safe_refine_margin": args.safe_refine_margin',
+        "--sger_warmup_start_epoch', type=int, default=3",
+        "--sger_warmup_end_epoch', type=int, default=6",
+        "'sger_warmup_start_epoch': args.sger_warmup_start_epoch",
+        "'sger_warmup_end_epoch': args.sger_warmup_end_epoch",
     ):
         assert flag in train_source
     for export_hook in (
@@ -841,5 +877,7 @@ if __name__ == "__main__":
     test_sger_lite_freeze_only_disables_backbone_parameters()
     test_residual_calibrated_confidence_uses_soft_floor()
     test_residual_calibrated_confidence_rejects_invalid_parameters()
+    test_resume_accepts_matching_or_legacy_sger_warmup_metadata()
+    test_resume_rejects_mismatched_sger_warmup_metadata()
     test_train_and_test_entrypoints_expose_sger_configuration()
     print("SGER unit tests: PASS")

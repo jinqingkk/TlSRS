@@ -181,6 +181,21 @@ def set_sger_warmup_state(model, args, epoch_idx):
     return scale
 
 
+def validate_sger_warmup_checkpoint(checkpoint, args):
+    start_epoch = checkpoint.get("sger_warmup_start_epoch")
+    end_epoch = checkpoint.get("sger_warmup_end_epoch")
+    if start_epoch is None and end_epoch is None:
+        return
+    expected = (
+        args.sger_warmup_start_epoch,
+        args.sger_warmup_end_epoch)
+    actual = (start_epoch, end_epoch)
+    if actual != expected:
+        raise RuntimeError(
+            "SGER warm-up configuration mismatch: checkpoint {} != "
+            "current {}".format(actual, expected))
+
+
 def is_sger_lite_parameter(module, name):
     trainable_prefixes = (
         "normal_head.{}.".format(module.num_stage - 1),
@@ -276,7 +291,9 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
                 torch.save({
                     'epoch': epoch_idx,
                     'model': model.module.state_dict(),
-                    'optimizer': optimizer.state_dict()},
+                    'optimizer': optimizer.state_dict(),
+                    'sger_warmup_start_epoch': args.sger_warmup_start_epoch,
+                    'sger_warmup_end_epoch': args.sger_warmup_end_epoch},
                     "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
         gc.collect()
 
@@ -571,6 +588,7 @@ if __name__ == '__main__':
         loadckpt = os.path.join(args.logdir, saved_models[-1])
         print("resuming", loadckpt)
         state_dict = torch.load(loadckpt, map_location=torch.device("cpu"))
+        validate_sger_warmup_checkpoint(state_dict, args)
         model.load_state_dict(state_dict['model'])
         optimizer.load_state_dict(state_dict['optimizer'])
         start_epoch = state_dict['epoch'] + 1
