@@ -165,6 +165,64 @@ def test_cascade_sger_lite_refines_stage3_only():
     assert torch.allclose(outputs["depth_refined"], stage3["depth_refined"])
 
 
+def test_cascade_sger_lite_scales_effective_residual():
+    torch.manual_seed(6)
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+        sger_hidden_channels=16,
+        sger_gate_channels=8,
+    )
+    model.eval()
+    with torch.no_grad():
+        model.sger_blocks[0].residual.output.bias.fill_(0.2)
+    imgs = torch.rand(1, 3, 3, 32, 32)
+    depth_values = torch.linspace(1.0, 2.0, 8).view(1, 8)
+    proj_matrices = {
+        key: _identity_proj(1, 3)
+        for key in ("stage1", "stage2", "stage3")
+    }
+
+    with torch.no_grad():
+        model.set_sger_residual_scale(0.0)
+        scale_zero = model(imgs, proj_matrices, depth_values)
+        model.set_sger_residual_scale(0.5)
+        scale_half = model(imgs, proj_matrices, depth_values)
+        model.set_sger_residual_scale(1.0)
+        scale_full = model(imgs, proj_matrices, depth_values)
+
+    assert torch.allclose(
+        scale_zero["depth_refined"], scale_zero["depth_raw"])
+    assert torch.all(scale_zero["depth_residual"] == 0)
+    assert torch.allclose(
+        scale_half["depth_residual"],
+        0.5 * scale_full["depth_residual"],
+        atol=1e-7)
+    assert torch.allclose(
+        scale_half["depth_refined"],
+        scale_half["depth_raw"] + scale_half["depth_residual"])
+    assert scale_half["sger_residual_scale"].item() == 0.5
+    assert "sger_residual_scale" not in model.state_dict()
+
+
+def test_cascade_sger_residual_scale_rejects_invalid_values():
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+    )
+    assert model.sger_residual_scale == 1.0
+
+    for scale in (-0.1, 1.1, float("nan"), float("inf")):
+        try:
+            model.set_sger_residual_scale(scale)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid residual scale must raise ValueError")
+
+
 def test_cascade_disabled_path_has_no_sger_only_outputs():
     model = CascadeMVSNet(
         ndepths=[8, 8, 8],
@@ -410,6 +468,82 @@ def test_safe_refine_loss_is_zero_for_improvement_and_applies_margin():
     assert torch.allclose(total_margin, torch.tensor(0.01))
 
 
+def test_sger_loss_scale_warms_all_refinement_terms():
+    raw = torch.full((1, 1, 2), 2.0, requires_grad=True)
+    refined = torch.full((1, 1, 2), 3.0, requires_grad=True)
+    outputs = {"stage1": {
+        "depth": refined,
+        "depth_raw": raw,
+        "residual_ratio": torch.full((1, 1, 2), 2.0),
+        "geometry_gate": torch.full((1, 1, 2), 0.5),
+    }}
+    depth_gt = {"stage1": torch.zeros(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    totals = []
+    extras = []
+    for scale in (0.0, 0.5, 1.0):
+        total, _, extra = _unpack_loss(cas_mvsnet_loss(
+            outputs,
+            depth_gt,
+            mask,
+            dlossw=[1.0],
+            raw_depth_loss_weight=1.0,
+            refined_depth_loss_weight=1.0,
+            residual_loss_weight=0.1,
+            gate_loss_weight=0.2,
+            safe_refine_loss_weight=0.3,
+            sger_loss_scale=scale,
+            return_extra=True,
+        ))
+        totals.append(total)
+        extras.append(extra)
+
+    assert torch.allclose(totals[0], torch.tensor(1.5))
+    assert torch.allclose(totals[1], torch.tensor(3.05))
+    assert torch.allclose(totals[2], torch.tensor(4.6))
+    expected_metrics = {
+        "sger_residual_scale": 0.5,
+        "effective_refined_depth_loss_weight": 0.5,
+        "effective_residual_loss_weight": 0.05,
+        "effective_gate_loss_weight": 0.1,
+        "effective_safe_refine_loss_weight": 0.15,
+    }
+    for key, expected in expected_metrics.items():
+        assert torch.allclose(extras[1][key], torch.tensor(expected))
+
+
+def test_sger_loss_scale_logs_refined_improved_pixel_ratio():
+    raw = torch.tensor([[[2.0, 2.0]]])
+    refined = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
+    outputs = {"stage1": {"depth": refined, "depth_raw": raw}}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    _, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs, depth_gt, mask, dlossw=[1.0], return_extra=True))
+
+    assert torch.allclose(
+        extra["stage1/refined_improved_pixel_ratio"], torch.tensor(0.5))
+
+
+def test_sger_loss_scale_rejects_invalid_values():
+    depth = torch.zeros(1, 1, 1, requires_grad=True)
+    outputs = {"stage1": {"depth": depth}}
+    depth_gt = {"stage1": torch.zeros(1, 1, 1)}
+    mask = {"stage1": torch.ones(1, 1, 1)}
+
+    for scale in (-0.1, 1.1, float("nan"), float("inf")):
+        try:
+            cas_mvsnet_loss(
+                outputs, depth_gt, mask,
+                sger_loss_scale=scale, return_extra=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid SGER loss scale must raise ValueError")
+
+
 def _load_train_helpers(*names):
     train_path = Path(__file__).resolve().parents[1] / "train.py"
     tree = ast.parse(train_path.read_text())
@@ -445,6 +579,84 @@ def test_sger_lite_optimizer_groups_cover_parameters_once():
     assert any(name.startswith("normal_head.2.") for name in sger_names)
     assert any(name.startswith("sger_blocks.") for name in sger_names)
     assert any(name.startswith("feature.") for name in backbone_names)
+
+
+def test_sger_warmup_schedule_matches_experiment13_epochs():
+    compute_sger_warmup_scale, = _load_train_helpers(
+        "compute_sger_warmup_scale")
+
+    actual = [
+        compute_sger_warmup_scale(epoch, 3, 6)
+        for epoch in range(8)
+    ]
+
+    assert actual == [0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0]
+    assert compute_sger_warmup_scale(2, 3, 3) == 0.0
+    assert compute_sger_warmup_scale(3, 3, 3) == 1.0
+
+
+def test_sger_warmup_schedule_rejects_invalid_epoch_ranges():
+    compute_sger_warmup_scale, = _load_train_helpers(
+        "compute_sger_warmup_scale")
+
+    for start_epoch, end_epoch in ((-1, 6), (3, -1), (6, 3)):
+        try:
+            compute_sger_warmup_scale(0, start_epoch, end_epoch)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid warm-up epochs must raise ValueError")
+
+
+def test_set_sger_warmup_state_updates_lite_model_and_loss_scale():
+    compute_scale, set_state = _load_train_helpers(
+        "compute_sger_warmup_scale", "set_sger_warmup_state")
+
+    class FakeModel:
+        use_sger_lite = True
+
+        def set_sger_residual_scale(self, scale):
+            self.scale = scale
+
+    class Args:
+        use_sger_lite = True
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    model = FakeModel()
+    args = Args()
+    scale = set_state(model, args, 3)
+
+    assert compute_scale(3, 3, 6) == 0.25
+    assert scale == 0.25
+    assert model.scale == 0.25
+    assert args.current_sger_warmup_scale == 0.25
+
+
+def test_set_sger_warmup_state_supports_wrapped_and_non_lite_models():
+    _, set_state = _load_train_helpers(
+        "compute_sger_warmup_scale", "set_sger_warmup_state")
+
+    class FakeModel:
+        def set_sger_residual_scale(self, scale):
+            self.scale = scale
+
+    class Wrapper:
+        def __init__(self, module):
+            self.module = module
+
+    class Args:
+        use_sger_lite = False
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    model = FakeModel()
+    args = Args()
+    scale = set_state(Wrapper(model), args, 0)
+
+    assert scale == 1.0
+    assert model.scale == 1.0
+    assert args.current_sger_warmup_scale == 1.0
 
 
 def test_non_lite_optimizer_group_keeps_base_learning_rate():
@@ -535,6 +747,38 @@ def test_residual_calibrated_confidence_rejects_invalid_parameters():
                 "invalid calibration parameters must raise ValueError")
 
 
+def test_resume_accepts_matching_or_legacy_sger_warmup_metadata():
+    validate, = _load_train_helpers("validate_sger_warmup_checkpoint")
+
+    class Args:
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    validate({}, Args())
+    validate({
+        "sger_warmup_start_epoch": 3,
+        "sger_warmup_end_epoch": 6,
+    }, Args())
+
+
+def test_resume_rejects_mismatched_sger_warmup_metadata():
+    validate, = _load_train_helpers("validate_sger_warmup_checkpoint")
+
+    class Args:
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    try:
+        validate({
+            "sger_warmup_start_epoch": 2,
+            "sger_warmup_end_epoch": 6,
+        }, Args())
+    except RuntimeError as error:
+        assert "warm-up configuration mismatch" in str(error)
+    else:
+        raise AssertionError("resume must reject a changed warm-up schedule")
+
+
 def test_train_and_test_entrypoints_expose_sger_configuration():
     root = Path(__file__).resolve().parents[1]
     train_source = (root / "train.py").read_text()
@@ -579,6 +823,10 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         '"gate_loss_weight": args.gate_loss_weight',
         '"safe_refine_loss_weight": args.safe_refine_loss_weight',
         '"safe_refine_margin": args.safe_refine_margin',
+        "--sger_warmup_start_epoch', type=int, default=3",
+        "--sger_warmup_end_epoch', type=int, default=6",
+        "'sger_warmup_start_epoch': args.sger_warmup_start_epoch",
+        "'sger_warmup_end_epoch': args.sger_warmup_end_epoch",
     ):
         assert flag in train_source
     for export_hook in (
@@ -607,6 +855,8 @@ if __name__ == "__main__":
     test_sger_refined_depth_backpropagates_through_learned_path()
     test_cascade_sger_returns_raw_and_refined_depth_for_every_stage()
     test_cascade_sger_lite_refines_stage3_only()
+    test_cascade_sger_lite_scales_effective_residual()
+    test_cascade_sger_residual_scale_rejects_invalid_values()
     test_cascade_disabled_path_has_no_sger_only_outputs()
     test_cascade_shared_sger_mode_runs_all_stages()
     test_cascade_uses_refined_depth_as_next_stage_sampling_center()
@@ -615,10 +865,19 @@ if __name__ == "__main__":
     test_sger_gate_loss_uses_only_valid_pixels()
     test_safe_refine_loss_penalizes_only_regressions()
     test_safe_refine_loss_is_zero_for_improvement_and_applies_margin()
+    test_sger_loss_scale_warms_all_refinement_terms()
+    test_sger_loss_scale_logs_refined_improved_pixel_ratio()
+    test_sger_loss_scale_rejects_invalid_values()
     test_sger_lite_optimizer_groups_cover_parameters_once()
+    test_sger_warmup_schedule_matches_experiment13_epochs()
+    test_sger_warmup_schedule_rejects_invalid_epoch_ranges()
+    test_set_sger_warmup_state_updates_lite_model_and_loss_scale()
+    test_set_sger_warmup_state_supports_wrapped_and_non_lite_models()
     test_non_lite_optimizer_group_keeps_base_learning_rate()
     test_sger_lite_freeze_only_disables_backbone_parameters()
     test_residual_calibrated_confidence_uses_soft_floor()
     test_residual_calibrated_confidence_rejects_invalid_parameters()
+    test_resume_accepts_matching_or_legacy_sger_warmup_metadata()
+    test_resume_rejects_mismatched_sger_warmup_metadata()
     test_train_and_test_entrypoints_expose_sger_configuration()
     print("SGER unit tests: PASS")

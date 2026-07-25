@@ -88,6 +88,8 @@ parser.add_argument('--safe_refine_loss_weight', type=float, default=0.1, help='
 parser.add_argument('--safe_refine_margin', type=float, default=0.0, help='raw-to-refined safety loss margin')
 parser.add_argument('--freeze_backbone_epochs', type=int, default=8, help='freeze non-SGER-Lite backbone for the first N epochs')
 parser.add_argument('--backbone_lr_scale', type=float, default=0.1, help='SGER-Lite backbone learning-rate multiplier after unfreezing')
+parser.add_argument('--sger_warmup_start_epoch', type=int, default=3, help='first epoch with a nonzero SGER residual scale')
+parser.add_argument('--sger_warmup_end_epoch', type=int, default=6, help='first epoch with the full SGER residual scale')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -111,6 +113,7 @@ def loss_kwargs(sample_cuda, args):
         "gate_loss_weight": args.gate_loss_weight,
         "safe_refine_loss_weight": args.safe_refine_loss_weight,
         "safe_refine_margin": args.safe_refine_margin,
+        "sger_loss_scale": getattr(args, "current_sger_warmup_scale", 1.0),
         "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
         "curv_loss_weight": args.curv_loss_weight,
         "edge_smooth_loss_weight": args.edge_smooth_loss_weight,
@@ -150,6 +153,47 @@ def validate_checkpoint_keys(missing_keys, unexpected_keys, use_sger, use_sger_l
             "checkpoint is incompatible with SGER initialization; "
             "unrelated missing keys: {}; unexpected keys: {}".format(
                 invalid_missing, list(unexpected_keys)))
+
+
+def compute_sger_warmup_scale(epoch_idx, start_epoch, end_epoch):
+    if start_epoch < 0 or end_epoch < 0:
+        raise ValueError("SGER warm-up epochs must be non-negative")
+    if end_epoch < start_epoch:
+        raise ValueError("SGER warm-up end must be >= start")
+    if epoch_idx < start_epoch:
+        return 0.0
+    if epoch_idx >= end_epoch:
+        return 1.0
+    return float(epoch_idx - start_epoch + 1) / float(
+        end_epoch - start_epoch + 1)
+
+
+def set_sger_warmup_state(model, args, epoch_idx):
+    module = model.module if hasattr(model, "module") else model
+    scale = 1.0
+    if args.use_sger_lite:
+        scale = compute_sger_warmup_scale(
+            epoch_idx,
+            args.sger_warmup_start_epoch,
+            args.sger_warmup_end_epoch)
+    module.set_sger_residual_scale(scale)
+    args.current_sger_warmup_scale = scale
+    return scale
+
+
+def validate_sger_warmup_checkpoint(checkpoint, args):
+    start_epoch = checkpoint.get("sger_warmup_start_epoch")
+    end_epoch = checkpoint.get("sger_warmup_end_epoch")
+    if start_epoch is None and end_epoch is None:
+        return
+    expected = (
+        args.sger_warmup_start_epoch,
+        args.sger_warmup_end_epoch)
+    actual = (start_epoch, end_epoch)
+    if actual != expected:
+        raise RuntimeError(
+            "SGER warm-up configuration mismatch: checkpoint {} != "
+            "current {}".format(actual, expected))
 
 
 def is_sger_lite_parameter(module, name):
@@ -208,6 +252,10 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
 
     for epoch_idx in range(start_epoch, args.epochs):
         print('Epoch {}:'.format(epoch_idx))
+        sger_warmup_scale = set_sger_warmup_state(model, args, epoch_idx)
+        if (not is_distributed) or (dist.get_rank() == 0):
+            print("SGER residual/loss scale: {:.4f}".format(
+                sger_warmup_scale))
         freeze_backbone = args.use_sger_lite and epoch_idx < args.freeze_backbone_epochs
         set_sger_lite_freeze(model, freeze_backbone)
         if freeze_backbone and ((not is_distributed) or (dist.get_rank() == 0)):
@@ -243,7 +291,9 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
                 torch.save({
                     'epoch': epoch_idx,
                     'model': model.module.state_dict(),
-                    'optimizer': optimizer.state_dict()},
+                    'optimizer': optimizer.state_dict(),
+                    'sger_warmup_start_epoch': args.sger_warmup_start_epoch,
+                    'sger_warmup_end_epoch': args.sger_warmup_end_epoch},
                     "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
         gc.collect()
 
@@ -538,6 +588,7 @@ if __name__ == '__main__':
         loadckpt = os.path.join(args.logdir, saved_models[-1])
         print("resuming", loadckpt)
         state_dict = torch.load(loadckpt, map_location=torch.device("cpu"))
+        validate_sger_warmup_checkpoint(state_dict, args)
         model.load_state_dict(state_dict['model'])
         optimizer.load_state_dict(state_dict['optimizer'])
         start_epoch = state_dict['epoch'] + 1

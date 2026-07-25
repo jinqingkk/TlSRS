@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -88,6 +89,7 @@ class CascadeMVSNet(nn.Module):
         self.use_sger_lite = use_sger_lite
         self.sger_enabled = use_sger or use_sger_lite
         self.sger_share = sger_share
+        self.sger_residual_scale = 1.0
         self.detach_refined_feedback = detach_refined_feedback
         self.sger_gate_kwargs = sger_gate_kwargs or {}
         self.num_stage = len(ndepths)
@@ -148,6 +150,13 @@ class CascadeMVSNet(nn.Module):
                         if self.use_sger_lite
                         else self.feature.out_channels[:self.num_stage])
                 ])
+
+    def set_sger_residual_scale(self, scale):
+        scale = float(scale)
+        if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
+            raise ValueError(
+                "sger residual scale must be finite and in [0, 1]")
+        self.sger_residual_scale = scale
 
     def forward(self, imgs, proj_matrices, depth_values):
         depth_min = float(depth_values[0, 0].cpu().numpy())
@@ -235,11 +244,21 @@ class CascadeMVSNet(nn.Module):
                     intrinsics_stage,
                     sger_feature,
                     depth_interval=self.depth_interals_ratio[stage_idx] * depth_interval)
+                effective_residual = (
+                    self.sger_residual_scale
+                    * sger_outputs["depth_residual"])
                 outputs_stage["depth_raw"] = depth_raw
-                outputs_stage["depth_refined"] = sger_outputs["depth_refined"]
-                outputs_stage["depth"] = sger_outputs["depth_refined"]
-                for key in ("depth_residual", "residual_ratio", "geometry_gate",
-                            "region_a", "region_b_weight", "normal_disagreement"):
+                outputs_stage["depth_residual"] = effective_residual
+                outputs_stage["residual_ratio"] = (
+                    self.sger_residual_scale
+                    * sger_outputs["residual_ratio"])
+                outputs_stage["depth_refined"] = (
+                    depth_raw + effective_residual)
+                outputs_stage["depth"] = outputs_stage["depth_refined"]
+                outputs_stage["sger_residual_scale"] = depth_raw.new_tensor(
+                    self.sger_residual_scale)
+                for key in ("geometry_gate", "region_a", "region_b_weight",
+                            "normal_disagreement"):
                     outputs_stage[key] = sger_outputs[key]
                 depth = outputs_stage["depth_refined"]
             else:
