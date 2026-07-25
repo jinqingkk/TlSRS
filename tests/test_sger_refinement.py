@@ -608,6 +608,57 @@ def test_sger_warmup_schedule_rejects_invalid_epoch_ranges():
             raise AssertionError("invalid warm-up epochs must raise ValueError")
 
 
+def test_set_sger_warmup_state_updates_lite_model_and_loss_scale():
+    compute_scale, set_state = _load_train_helpers(
+        "compute_sger_warmup_scale", "set_sger_warmup_state")
+
+    class FakeModel:
+        use_sger_lite = True
+
+        def set_sger_residual_scale(self, scale):
+            self.scale = scale
+
+    class Args:
+        use_sger_lite = True
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    model = FakeModel()
+    args = Args()
+    scale = set_state(model, args, 3)
+
+    assert compute_scale(3, 3, 6) == 0.25
+    assert scale == 0.25
+    assert model.scale == 0.25
+    assert args.current_sger_warmup_scale == 0.25
+
+
+def test_set_sger_warmup_state_supports_wrapped_and_non_lite_models():
+    _, set_state = _load_train_helpers(
+        "compute_sger_warmup_scale", "set_sger_warmup_state")
+
+    class FakeModel:
+        def set_sger_residual_scale(self, scale):
+            self.scale = scale
+
+    class Wrapper:
+        def __init__(self, module):
+            self.module = module
+
+    class Args:
+        use_sger_lite = False
+        sger_warmup_start_epoch = 3
+        sger_warmup_end_epoch = 6
+
+    model = FakeModel()
+    args = Args()
+    scale = set_state(Wrapper(model), args, 0)
+
+    assert scale == 1.0
+    assert model.scale == 1.0
+    assert args.current_sger_warmup_scale == 1.0
+
+
 def test_non_lite_optimizer_group_keeps_base_learning_rate():
     _, build_optimizer_param_groups = _load_train_helpers(
         "is_sger_lite_parameter", "build_optimizer_param_groups")
@@ -784,6 +835,8 @@ if __name__ == "__main__":
     test_sger_lite_optimizer_groups_cover_parameters_once()
     test_sger_warmup_schedule_matches_experiment13_epochs()
     test_sger_warmup_schedule_rejects_invalid_epoch_ranges()
+    test_set_sger_warmup_state_updates_lite_model_and_loss_scale()
+    test_set_sger_warmup_state_supports_wrapped_and_non_lite_models()
     test_non_lite_optimizer_group_keeps_base_learning_rate()
     test_sger_lite_freeze_only_disables_backbone_parameters()
     test_residual_calibrated_confidence_uses_soft_floor()

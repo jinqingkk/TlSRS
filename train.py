@@ -168,6 +168,19 @@ def compute_sger_warmup_scale(epoch_idx, start_epoch, end_epoch):
         end_epoch - start_epoch + 1)
 
 
+def set_sger_warmup_state(model, args, epoch_idx):
+    module = model.module if hasattr(model, "module") else model
+    scale = 1.0
+    if args.use_sger_lite:
+        scale = compute_sger_warmup_scale(
+            epoch_idx,
+            args.sger_warmup_start_epoch,
+            args.sger_warmup_end_epoch)
+    module.set_sger_residual_scale(scale)
+    args.current_sger_warmup_scale = scale
+    return scale
+
+
 def is_sger_lite_parameter(module, name):
     trainable_prefixes = (
         "normal_head.{}.".format(module.num_stage - 1),
@@ -224,6 +237,10 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
 
     for epoch_idx in range(start_epoch, args.epochs):
         print('Epoch {}:'.format(epoch_idx))
+        sger_warmup_scale = set_sger_warmup_state(model, args, epoch_idx)
+        if (not is_distributed) or (dist.get_rank() == 0):
+            print("SGER residual/loss scale: {:.4f}".format(
+                sger_warmup_scale))
         freeze_backbone = args.use_sger_lite and epoch_idx < args.freeze_backbone_epochs
         set_sger_lite_freeze(model, freeze_backbone)
         if freeze_backbone and ((not is_distributed) or (dist.get_rank() == 0)):
