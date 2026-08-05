@@ -83,13 +83,17 @@ parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedba
 parser.add_argument('--raw_depth_loss_weight', type=float, default=1.0, help='auxiliary raw stage depth loss weight')
 parser.add_argument('--refined_depth_loss_weight', type=float, default=1.0, help='refined stage depth loss weight')
 parser.add_argument('--residual_loss_weight', type=float, default=0.01, help='normalized SGER residual regularization weight')
-parser.add_argument('--gate_loss_weight', type=float, default=0.001, help='SGER geometry gate sparsity loss weight')
+parser.add_argument('--gate_loss_weight', type=float, default=0.0, help='legacy SGER gate mean penalty weight')
 parser.add_argument('--safe_refine_loss_weight', type=float, default=0.1, help='penalty when refined depth is worse than raw depth')
 parser.add_argument('--safe_refine_margin', type=float, default=0.0, help='raw-to-refined safety loss margin')
+parser.add_argument('--residual_target_loss_weight', type=float, default=0.05, help='bounded SGER residual proposal supervision weight')
+parser.add_argument('--gate_benefit_loss_weight', type=float, default=0.05, help='benefit-supervised SGER gate loss weight')
+parser.add_argument('--residual_target_ratio', type=float, default=0.25, help='maximum residual target in stage depth intervals')
+parser.add_argument('--benefit_margin_ratio', type=float, default=0.05, help='minimum proposal improvement in stage depth intervals')
 parser.add_argument('--freeze_backbone_epochs', type=int, default=8, help='freeze non-SGER-Lite backbone for the first N epochs')
 parser.add_argument('--backbone_lr_scale', type=float, default=0.1, help='SGER-Lite backbone learning-rate multiplier after unfreezing')
-parser.add_argument('--sger_warmup_start_epoch', type=int, default=3, help='first epoch with a nonzero SGER residual scale')
-parser.add_argument('--sger_warmup_end_epoch', type=int, default=6, help='first epoch with the full SGER residual scale')
+parser.add_argument('--sger_warmup_start_epoch', type=int, default=7, help='first epoch with a nonzero SGER residual scale')
+parser.add_argument('--sger_warmup_end_epoch', type=int, default=10, help='first epoch with the full SGER residual scale')
 
 parser.add_argument('--using_apex', action='store_true', help='using apex, need to install apex')
 parser.add_argument('--sync_bn', action='store_true',help='enabling apex sync BN.')
@@ -113,6 +117,14 @@ def loss_kwargs(sample_cuda, args):
         "gate_loss_weight": args.gate_loss_weight,
         "safe_refine_loss_weight": args.safe_refine_loss_weight,
         "safe_refine_margin": args.safe_refine_margin,
+        "residual_target_loss_weight": args.residual_target_loss_weight,
+        "gate_benefit_loss_weight": args.gate_benefit_loss_weight,
+        "residual_target_ratio": args.residual_target_ratio,
+        "benefit_margin_ratio": args.benefit_margin_ratio,
+        "residual_target_loss_scale": getattr(
+            args, "current_residual_target_loss_scale", 1.0),
+        "gate_benefit_loss_scale": getattr(
+            args, "current_gate_benefit_loss_scale", 1.0),
         "sger_loss_scale": getattr(args, "current_sger_warmup_scale", 1.0),
         "normal_smooth_loss_weight": args.normal_smooth_loss_weight,
         "curv_loss_weight": args.curv_loss_weight,
@@ -166,6 +178,33 @@ def compute_sger_warmup_scale(epoch_idx, start_epoch, end_epoch):
         return 1.0
     return float(epoch_idx - start_epoch + 1) / float(
         end_epoch - start_epoch + 1)
+
+
+def compute_experiment14_loss_scales(
+        epoch_idx, residual_start_epoch=4,
+        gate_start_epoch=7, gate_end_epoch=10):
+    if residual_start_epoch < 0 or gate_start_epoch < 0 or gate_end_epoch < 0:
+        raise ValueError("Experiment14 schedule epochs must be non-negative")
+    if gate_end_epoch < gate_start_epoch:
+        raise ValueError("benefit gate end epoch must be >= start epoch")
+    residual_scale = 1.0 if epoch_idx >= residual_start_epoch else 0.0
+    if epoch_idx < gate_start_epoch:
+        gate_scale = 0.0
+    elif epoch_idx >= gate_end_epoch:
+        gate_scale = 1.0
+    else:
+        gate_scale = float(epoch_idx - gate_start_epoch + 1) / float(
+            gate_end_epoch - gate_start_epoch + 1)
+    return residual_scale, gate_scale
+
+
+def set_experiment14_loss_state(args, epoch_idx):
+    residual_scale, gate_scale = compute_experiment14_loss_scales(epoch_idx)
+    if not args.use_sger_lite:
+        residual_scale, gate_scale = 1.0, 1.0
+    args.current_residual_target_loss_scale = residual_scale
+    args.current_gate_benefit_loss_scale = gate_scale
+    return residual_scale, gate_scale
 
 
 def set_sger_warmup_state(model, args, epoch_idx):
@@ -253,9 +292,15 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
     for epoch_idx in range(start_epoch, args.epochs):
         print('Epoch {}:'.format(epoch_idx))
         sger_warmup_scale = set_sger_warmup_state(model, args, epoch_idx)
+        residual_target_scale, benefit_gate_scale = (
+            set_experiment14_loss_state(args, epoch_idx))
         if (not is_distributed) or (dist.get_rank() == 0):
             print("SGER residual/loss scale: {:.4f}".format(
                 sger_warmup_scale))
+            print(
+                "Experiment14 residual-target/gate-benefit scales: "
+                "{:.4f}/{:.4f}".format(
+                    residual_target_scale, benefit_gate_scale))
         freeze_backbone = args.use_sger_lite and epoch_idx < args.freeze_backbone_epochs
         set_sger_lite_freeze(model, freeze_backbone)
         if freeze_backbone and ((not is_distributed) or (dist.get_rank() == 0)):

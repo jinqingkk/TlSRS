@@ -153,14 +153,17 @@ class SGERBlock(nn.Module):
         self.cues = GeometryCueExtractor()
         self.feature_projection = nn.Conv2d(
             feature_channels, projected_feature_channels, 1, bias=False)
-        fused_channels = 15 + projected_feature_channels
+        self.uncertainty_channels = 3
+        fused_channels = (
+            15 + projected_feature_channels + self.uncertainty_channels)
         self.gate = DualRegionGate(
             fused_channels, hidden_channels=gate_channels, **gate_kwargs)
         self.residual = ResidualDepthHead(
             fused_channels, hidden_channels=hidden_channels)
 
     def forward(self, depth, normal_pred, confidence, ref_img,
-                intrinsics, ref_feature, depth_interval, valid_mask=None):
+                intrinsics, ref_feature, depth_interval, valid_mask=None,
+                uncertainty=None):
         depth = _as_depth_map(depth)
         confidence = _as_depth_map(confidence)
 
@@ -180,27 +183,42 @@ class SGERBlock(nn.Module):
             feature = F.interpolate(
                 feature, size=depth.shape[-2:],
                 mode="bilinear", align_corners=False)
-        fused = torch.cat([cues["cue_tensor"], feature], dim=1)
+        if uncertainty is None:
+            uncertainty = depth.new_zeros(
+                depth.size(0), self.uncertainty_channels,
+                depth.size(1), depth.size(2))
+        assert uncertainty.dim() == 4
+        assert uncertainty.size(1) == self.uncertainty_channels
+        if uncertainty.shape[-2:] != depth.shape[-2:]:
+            uncertainty = F.interpolate(
+                uncertainty, size=depth.shape[-2:],
+                mode="bilinear", align_corners=False)
+        uncertainty = torch.where(
+            torch.isfinite(uncertainty), uncertainty,
+            torch.zeros_like(uncertainty))
+        fused = torch.cat([
+            cues["cue_tensor"], feature, uncertainty], dim=1)
 
-        gate, region_a, region_b, weight_b = self.gate(
+        benefit_gate, region_a, region_b, weight_b = self.gate(
             fused, ref_img, depth, confidence, cues["valid_mask"])
         residual_logit = self.residual(fused)
         interval = float(depth_interval)
         max_residual = self.max_residual_ratio * interval
         raw_residual = max_residual * torch.tanh(residual_logit)
-        gated_residual = gate * raw_residual
+        gated_residual = benefit_gate * raw_residual
         depth_refined = depth + gated_residual
         residual_ratio = gated_residual.abs() / (interval + 1e-6)
 
         return {
             "depth_refined": depth_refined,
+            "raw_depth_residual": raw_residual,
             "depth_residual": gated_residual,
             "residual_ratio": residual_ratio,
-            "geometry_gate": gate,
+            "benefit_gate": benefit_gate,
+            "geometry_gate": benefit_gate,
             "region_a": region_a,
             "region_b": region_b,
             "region_b_weight": weight_b,
             "normal_depth": cues["normal_depth"],
             "normal_disagreement": cues["normal_disagreement"],
         }
-

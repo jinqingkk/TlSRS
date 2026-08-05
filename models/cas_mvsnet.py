@@ -7,6 +7,34 @@ from .sger_refinement import SGERBlock
 
 Align_Corners_Range = False
 
+
+def probability_volume_statistics(prob_volume, depth_values):
+    """Return normalized entropy, depth variance, and peak separation."""
+    assert prob_volume.dim() == 4, "expected probability shape (B,D,H,W)"
+    assert depth_values.shape == prob_volume.shape
+    num_depth = prob_volume.size(1)
+    if num_depth == 1:
+        zeros = prob_volume[:, 0] * 0.0
+        return {
+            "probability_entropy": zeros,
+            "depth_variance": zeros,
+            "top1_top2_margin": torch.ones_like(zeros),
+        }
+
+    entropy = -(prob_volume * torch.log(prob_volume.clamp_min(1e-12))).sum(1)
+    entropy = entropy / math.log(float(num_depth))
+    depth_mean = (prob_volume * depth_values).sum(1)
+    depth_variance = (
+        prob_volume * (depth_values - depth_mean.unsqueeze(1)).pow(2)
+    ).sum(1)
+    top_probabilities = torch.topk(prob_volume, 2, dim=1)[0]
+    top1_top2_margin = top_probabilities[:, 0] - top_probabilities[:, 1]
+    return {
+        "probability_entropy": entropy,
+        "depth_variance": depth_variance,
+        "top1_top2_margin": top1_top2_margin,
+    }
+
 class DepthNet(nn.Module):
     def __init__(self):
         super(DepthNet, self).__init__()
@@ -57,6 +85,7 @@ class DepthNet(nn.Module):
 
         prob_volume = F.softmax(prob_volume_pre, dim=1)
         depth = depth_regression(prob_volume, depth_values=depth_values)
+        uncertainty = probability_volume_statistics(prob_volume, depth_values)
 
         with torch.no_grad():
             # photometric confidence
@@ -65,7 +94,10 @@ class DepthNet(nn.Module):
             depth_index = depth_index.clamp(min=0, max=num_depth-1)
             photometric_confidence = torch.gather(prob_volume_sum4, 1, depth_index.unsqueeze(1)).squeeze(1)
 
-        return {"depth": depth,  "photometric_confidence": photometric_confidence}
+        return dict(
+            {"depth": depth,
+             "photometric_confidence": photometric_confidence},
+            **uncertainty)
 
 
 class CascadeMVSNet(nn.Module):
@@ -236,18 +268,31 @@ class CascadeMVSNet(nn.Module):
                 else:
                     sger_feature = ref_feature
                     sger_block = self.sger_blocks[0 if self.use_sger_lite else stage_idx]
+                stage_interval = (
+                    self.depth_interals_ratio[stage_idx] * depth_interval)
+                uncertainty = torch.stack([
+                    outputs_stage["probability_entropy"],
+                    outputs_stage["depth_variance"] / (
+                        stage_interval * stage_interval + 1e-6),
+                    outputs_stage["top1_top2_margin"],
+                ], dim=1)
                 sger_outputs = sger_block(
-                    depth_raw,
+                    depth_raw.detach(),
                     outputs_stage["normal"],
                     outputs_stage["photometric_confidence"],
                     ref_img_stage,
                     intrinsics_stage,
                     sger_feature,
-                    depth_interval=self.depth_interals_ratio[stage_idx] * depth_interval)
+                    depth_interval=stage_interval,
+                    uncertainty=uncertainty)
                 effective_residual = (
                     self.sger_residual_scale
                     * sger_outputs["depth_residual"])
                 outputs_stage["depth_raw"] = depth_raw
+                outputs_stage["depth_interval"] = depth_raw.new_tensor(
+                    stage_interval)
+                outputs_stage["raw_depth_residual"] = (
+                    sger_outputs["raw_depth_residual"])
                 outputs_stage["depth_residual"] = effective_residual
                 outputs_stage["residual_ratio"] = (
                     self.sger_residual_scale
@@ -257,8 +302,8 @@ class CascadeMVSNet(nn.Module):
                 outputs_stage["depth"] = outputs_stage["depth_refined"]
                 outputs_stage["sger_residual_scale"] = depth_raw.new_tensor(
                     self.sger_residual_scale)
-                for key in ("geometry_gate", "region_a", "region_b_weight",
-                            "normal_disagreement"):
+                for key in ("benefit_gate", "geometry_gate", "region_a",
+                            "region_b_weight", "normal_disagreement"):
                     outputs_stage[key] = sger_outputs[key]
                 depth = outputs_stage["depth_refined"]
             else:

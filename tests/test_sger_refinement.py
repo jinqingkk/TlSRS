@@ -5,8 +5,12 @@ import torch.nn.functional as F
 from pathlib import Path
 
 import models.cas_mvsnet as cas_module
-from models.cas_mvsnet import CascadeMVSNet
-from models.module import cas_mvsnet_loss
+from models.cas_mvsnet import CascadeMVSNet, probability_volume_statistics
+from models.module import (
+    bounded_residual_target,
+    cas_mvsnet_loss,
+    residual_benefit_target,
+)
 from models.sger_refinement import SGERBlock
 
 
@@ -19,6 +23,37 @@ def make_sger_inputs(batch=2, height=8, width=12, feature_channels=8):
     intrinsics = torch.eye(3).unsqueeze(0).repeat(batch, 1, 1)
     ref_feature = torch.randn(batch, feature_channels, height, width)
     return depth, normal, confidence, ref_img, intrinsics, ref_feature
+
+
+def test_probability_volume_statistics_measure_uncertainty():
+    probability = torch.full((1, 4, 2, 3), 0.25)
+    depth_values = torch.arange(1.0, 5.0).view(1, 4, 1, 1).expand_as(
+        probability)
+
+    statistics = probability_volume_statistics(probability, depth_values)
+
+    assert set(statistics) == {
+        "probability_entropy", "depth_variance", "top1_top2_margin"}
+    for value in statistics.values():
+        assert value.shape == (1, 2, 3)
+        assert torch.isfinite(value).all()
+    assert torch.allclose(
+        statistics["probability_entropy"], torch.ones(1, 2, 3))
+    assert torch.allclose(
+        statistics["depth_variance"], torch.full((1, 2, 3), 1.25))
+    assert torch.allclose(
+        statistics["top1_top2_margin"], torch.zeros(1, 2, 3))
+
+
+def test_probability_volume_statistics_handle_single_depth_bin():
+    probability = torch.ones(1, 1, 2, 3)
+    depth_values = torch.full_like(probability, 2.0)
+
+    statistics = probability_volume_statistics(probability, depth_values)
+
+    assert torch.all(statistics["probability_entropy"] == 0)
+    assert torch.all(statistics["depth_variance"] == 0)
+    assert torch.all(statistics["top1_top2_margin"] == 1)
 
 
 def test_sger_block_returns_bounded_outputs():
@@ -37,6 +72,30 @@ def test_sger_block_returns_bounded_outputs():
     assert outputs["geometry_gate"].max().item() <= 1.0
     assert outputs["depth_residual"].abs().max().item() <= 1.0 + 1e-6
     assert torch.allclose(outputs["depth_refined"], inputs[0], atol=1e-7)
+
+
+def test_sger_block_separates_residual_proposal_and_benefit_gate():
+    block = SGERBlock(feature_channels=8, hidden_channels=16,
+                      max_residual_ratio=0.25)
+    inputs = make_sger_inputs()
+    uncertainty = torch.stack([
+        torch.full_like(inputs[0], 0.8),
+        torch.full_like(inputs[0], 0.1),
+        torch.full_like(inputs[0], 0.2),
+    ], dim=1)
+    with torch.no_grad():
+        block.residual.output.bias.fill_(0.2)
+
+    outputs = block(
+        *inputs, depth_interval=0.5, uncertainty=uncertainty)
+
+    assert outputs["raw_depth_residual"].shape == inputs[0].shape
+    assert outputs["benefit_gate"].shape == inputs[0].shape
+    assert torch.allclose(
+        outputs["depth_residual"],
+        outputs["benefit_gate"] * outputs["raw_depth_residual"])
+    assert torch.allclose(outputs["geometry_gate"], outputs["benefit_gate"])
+    assert outputs["raw_depth_residual"].abs().max().item() <= 0.125 + 1e-6
 
 
 def test_sger_regions_ignore_invalid_depth_and_are_disjoint():
@@ -159,6 +218,11 @@ def test_cascade_sger_lite_refines_stage3_only():
     assert "depth_refined" in stage3
     assert "depth_residual" in stage3
     assert "geometry_gate" in stage3
+    assert "benefit_gate" in stage3
+    assert "raw_depth_residual" in stage3
+    assert "probability_entropy" in stage3
+    assert "depth_variance" in stage3
+    assert "top1_top2_margin" in stage3
     assert torch.allclose(stage3["depth"], stage3["depth_refined"])
     assert torch.allclose(outputs["depth"], stage3["depth_refined"])
     assert torch.allclose(outputs["depth_raw"], stage3["depth_raw"])
@@ -353,6 +417,85 @@ def test_sger_loss_supervises_raw_and_refined_depth_separately():
     assert torch.allclose(extra["stage1/raw_to_refined_error_delta"], torch.tensor(1.0))
     assert torch.allclose(depth_loss, torch.tensor(0.5))
     assert torch.allclose(total, torch.tensor(1.25))
+
+
+def test_bounded_residual_target_has_correct_direction_and_limit():
+    depth_raw = torch.tensor([[[2.0, 0.0]]], requires_grad=True)
+    depth_gt = torch.tensor([[[3.0, -3.0]]])
+
+    target = bounded_residual_target(
+        depth_raw, depth_gt, depth_interval=2.0,
+        max_residual_ratio=0.25)
+
+    assert torch.allclose(target, torch.tensor([[[0.5, -0.5]]]))
+    assert not target.requires_grad
+
+
+def test_residual_benefit_target_requires_margin_improvement():
+    depth_raw = torch.tensor([[[2.0, 2.0]]])
+    raw_residual = torch.tensor([[[-0.8, 0.8]]], requires_grad=True)
+    depth_gt = torch.ones(1, 1, 2)
+
+    target = residual_benefit_target(
+        depth_raw, raw_residual, depth_gt,
+        depth_interval=1.0, margin_ratio=0.05)
+
+    assert torch.equal(target, torch.tensor([[[True, False]]]))
+    assert not target.requires_grad
+
+
+def test_sger_benefit_supervision_reports_selective_refinement_metrics():
+    raw = torch.tensor([[[2.0, 2.0]]], requires_grad=True)
+    proposal = torch.tensor([[[-0.8, 0.8]]], requires_grad=True)
+    gate = torch.tensor([[[0.8, 0.2]]], requires_grad=True)
+    refined = raw.detach() + gate * proposal
+    outputs = {"stage1": {
+        "depth": refined,
+        "depth_raw": raw,
+        "raw_depth_residual": proposal,
+        "depth_residual": gate * proposal,
+        "benefit_gate": gate,
+        "geometry_gate": gate,
+        "depth_interval": raw.new_tensor(1.0),
+    }}
+    depth_gt = {"stage1": torch.ones(1, 1, 2)}
+    mask = {"stage1": torch.ones(1, 1, 2)}
+
+    total, _, extra = _unpack_loss(cas_mvsnet_loss(
+        outputs, depth_gt, mask,
+        dlossw=[0.0],
+        raw_depth_loss_weight=0.0,
+        refined_depth_loss_weight=0.0,
+        residual_target_loss_weight=1.0,
+        gate_benefit_loss_weight=1.0,
+        residual_target_ratio=0.25,
+        benefit_margin_ratio=0.05,
+        return_extra=True))
+
+    assert total.item() > 0
+    assert torch.allclose(
+        extra["stage1/raw_abs_error"], torch.tensor(1.0))
+    assert torch.allclose(
+        extra["stage1/refined_abs_error"], torch.tensor(0.76))
+    assert torch.allclose(
+        extra["stage1/benefit_gate_mean"], torch.tensor(0.5))
+    assert torch.allclose(
+        extra["stage1/refined_improved_pixel_ratio"], torch.tensor(0.5))
+    assert torch.allclose(
+        extra["stage1/refined_worsened_pixel_ratio"], torch.tensor(0.5))
+    assert torch.allclose(
+        extra["stage1/gate_on_improved_mean"], torch.tensor(0.8))
+    assert torch.allclose(
+        extra["stage1/gate_on_worsened_mean"], torch.tensor(0.2))
+    assert torch.allclose(
+        extra["stage1/residual_sign_accuracy"], torch.tensor(0.5))
+    assert "stage1/residual_target_loss" in extra
+    assert "stage1/gate_benefit_loss" in extra
+    total.backward()
+    assert proposal.grad is not None
+    assert gate.grad is not None
+    assert raw.grad is not None
+    assert torch.all(raw.grad == 0)
 
 
 def test_sger_loss_regularizes_normalized_gated_residual():
@@ -595,6 +738,18 @@ def test_sger_warmup_schedule_matches_experiment13_epochs():
     assert compute_sger_warmup_scale(3, 3, 3) == 1.0
 
 
+def test_experiment14_loss_schedule_separates_proposal_and_gate_training():
+    compute_scales, = _load_train_helpers(
+        "compute_experiment14_loss_scales")
+
+    assert compute_scales(2) == (0.0, 0.0)
+    assert compute_scales(3) == (0.0, 0.0)
+    assert compute_scales(5) == (1.0, 0.0)
+    assert compute_scales(7) == (1.0, 0.25)
+    assert compute_scales(8) == (1.0, 0.5)
+    assert compute_scales(10) == (1.0, 1.0)
+
+
 def test_sger_warmup_schedule_rejects_invalid_epoch_ranges():
     compute_sger_warmup_scale, = _load_train_helpers(
         "compute_sger_warmup_scale")
@@ -816,15 +971,21 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
         "--raw_depth_loss_weight', type=float, default=1.0",
         "--refined_depth_loss_weight', type=float, default=1.0",
         "--residual_loss_weight', type=float, default=0.01",
-        "--gate_loss_weight', type=float, default=0.001",
+        "--gate_loss_weight', type=float, default=0.0",
         "--safe_refine_loss_weight', type=float, default=0.1",
         "--safe_refine_margin', type=float, default=0.0",
         "--backbone_lr_scale', type=float, default=0.1",
         '"gate_loss_weight": args.gate_loss_weight',
         '"safe_refine_loss_weight": args.safe_refine_loss_weight',
         '"safe_refine_margin": args.safe_refine_margin',
-        "--sger_warmup_start_epoch', type=int, default=3",
-        "--sger_warmup_end_epoch', type=int, default=6",
+        "--sger_warmup_start_epoch', type=int, default=7",
+        "--sger_warmup_end_epoch', type=int, default=10",
+        "--residual_target_loss_weight', type=float, default=0.05",
+        "--gate_benefit_loss_weight', type=float, default=0.05",
+        "--residual_target_ratio', type=float, default=0.25",
+        "--benefit_margin_ratio', type=float, default=0.05",
+        '"residual_target_loss_weight": args.residual_target_loss_weight',
+        '"gate_benefit_loss_weight": args.gate_benefit_loss_weight',
         "'sger_warmup_start_epoch': args.sger_warmup_start_epoch",
         "'sger_warmup_end_epoch': args.sger_warmup_end_epoch",
     ):
@@ -849,7 +1010,10 @@ def test_train_and_test_entrypoints_expose_sger_configuration():
 
 
 if __name__ == "__main__":
+    test_probability_volume_statistics_measure_uncertainty()
+    test_probability_volume_statistics_handle_single_depth_bin()
     test_sger_block_returns_bounded_outputs()
+    test_sger_block_separates_residual_proposal_and_benefit_gate()
     test_sger_regions_ignore_invalid_depth_and_are_disjoint()
     test_sger_sanitizes_nonfinite_depth_before_geometry_processing()
     test_sger_refined_depth_backpropagates_through_learned_path()
@@ -861,6 +1025,9 @@ if __name__ == "__main__":
     test_cascade_shared_sger_mode_runs_all_stages()
     test_cascade_uses_refined_depth_as_next_stage_sampling_center()
     test_sger_loss_supervises_raw_and_refined_depth_separately()
+    test_bounded_residual_target_has_correct_direction_and_limit()
+    test_residual_benefit_target_requires_margin_improvement()
+    test_sger_benefit_supervision_reports_selective_refinement_metrics()
     test_sger_loss_regularizes_normalized_gated_residual()
     test_sger_gate_loss_uses_only_valid_pixels()
     test_safe_refine_loss_penalizes_only_regressions()
@@ -870,6 +1037,7 @@ if __name__ == "__main__":
     test_sger_loss_scale_rejects_invalid_values()
     test_sger_lite_optimizer_groups_cover_parameters_once()
     test_sger_warmup_schedule_matches_experiment13_epochs()
+    test_experiment14_loss_schedule_separates_proposal_and_gate_training()
     test_sger_warmup_schedule_rejects_invalid_epoch_ranges()
     test_set_sger_warmup_state_updates_lite_model_and_loss_scale()
     test_set_sger_warmup_state_supports_wrapped_and_non_lite_models()
