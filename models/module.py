@@ -849,6 +849,49 @@ def edge_aware_smooth_loss(depth, ref_img, mask):
     return masked_mean(depth_dx * weight_x, mask_x) + masked_mean(depth_dy * weight_y, mask_y)
 
 
+def bounded_residual_target(depth_raw, depth_gt, depth_interval,
+                            max_residual_ratio=0.25):
+    """Build a detached, interval-bounded target for the SGER proposal."""
+    interval = torch.as_tensor(
+        depth_interval, dtype=depth_raw.dtype,
+        device=depth_raw.device).detach()
+    max_residual = float(max_residual_ratio) * interval
+    return (depth_gt - depth_raw.detach()).clamp(
+        min=-max_residual, max=max_residual).detach()
+
+
+def residual_benefit_target(depth_raw, raw_residual, depth_gt,
+                            depth_interval, margin_ratio=0.05):
+    """Label proposals that reduce raw error by an interval-scaled margin."""
+    raw_error = (depth_raw.detach() - depth_gt).abs()
+    proposal_error = (
+        depth_raw.detach() + raw_residual.detach() - depth_gt).abs()
+    interval = torch.as_tensor(
+        depth_interval, dtype=depth_raw.dtype,
+        device=depth_raw.device).detach()
+    margin = float(margin_ratio) * interval
+    return (proposal_error + margin < raw_error).detach()
+
+
+def balanced_binary_cross_entropy(prediction, target, mask):
+    prediction = prediction.clamp(1e-6, 1.0 - 1e-6)
+    target = target.float()
+    valid_target = target[mask]
+    valid_prediction = prediction[mask]
+    if valid_target.numel() == 0:
+        return prediction.sum() * 0.0
+    positive_fraction = valid_target.mean().detach()
+    if positive_fraction.item() <= 0.0 or positive_fraction.item() >= 1.0:
+        return F.binary_cross_entropy(valid_prediction, valid_target)
+    weights = torch.where(
+        valid_target > 0.5,
+        1.0 - positive_fraction,
+        positive_fraction)
+    losses = F.binary_cross_entropy(
+        valid_prediction, valid_target, reduction="none")
+    return (losses * weights).sum() / (weights.sum() + 1e-6)
+
+
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     depth_loss_weights = kwargs.get("dlossw", None)
     raw_depth_loss_weight = kwargs.get("raw_depth_loss_weight", 0.5)
@@ -857,6 +900,15 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     gate_loss_weight = kwargs.get("gate_loss_weight", 0.0)
     safe_refine_loss_weight = kwargs.get("safe_refine_loss_weight", 0.0)
     safe_refine_margin = kwargs.get("safe_refine_margin", 0.0)
+    residual_target_loss_weight = kwargs.get(
+        "residual_target_loss_weight", 0.0)
+    gate_benefit_loss_weight = kwargs.get("gate_benefit_loss_weight", 0.0)
+    residual_target_ratio = kwargs.get("residual_target_ratio", 0.25)
+    benefit_margin_ratio = kwargs.get("benefit_margin_ratio", 0.05)
+    residual_target_loss_scale = float(kwargs.get(
+        "residual_target_loss_scale", 1.0))
+    gate_benefit_loss_scale = float(kwargs.get(
+        "gate_benefit_loss_scale", 1.0))
     sger_loss_scale = float(kwargs.get("sger_loss_scale", 1.0))
     if not math.isfinite(sger_loss_scale) or not 0.0 <= sger_loss_scale <= 1.0:
         raise ValueError("sger_loss_scale must be finite and within [0, 1]")
@@ -866,6 +918,10 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     effective_gate_loss_weight = sger_loss_scale * gate_loss_weight
     effective_safe_refine_loss_weight = (
         sger_loss_scale * safe_refine_loss_weight)
+    effective_residual_target_loss_weight = (
+        residual_target_loss_scale * residual_target_loss_weight)
+    effective_gate_benefit_loss_weight = (
+        gate_benefit_loss_scale * gate_benefit_loss_weight)
     imgs = kwargs.get("imgs", None)
     proj_matrices = kwargs.get("proj_matrices", None)
     normal_smooth_loss_weight = kwargs.get("normal_smooth_loss_weight", 0.0)
@@ -930,6 +986,10 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 effective_gate_loss_weight)
             extra["effective_safe_refine_loss_weight"] = (
                 total_loss.new_tensor(effective_safe_refine_loss_weight))
+            extra["effective_residual_target_loss_weight"] = (
+                total_loss.new_tensor(effective_residual_target_loss_weight))
+            extra["effective_gate_benefit_loss_weight"] = (
+                total_loss.new_tensor(effective_gate_benefit_loss_weight))
             raw_depth_loss = F.smooth_l1_loss(
                 depth_raw[mask], depth_gt[mask], reduction='mean')
             stage_depth_loss = (
@@ -939,6 +999,10 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             extra["{}/refined_depth_loss".format(stage_key)] = refined_depth_loss.detach()
             raw_abs_error = masked_mean((depth_raw - depth_gt).abs(), mask)
             refined_abs_error = masked_mean((depth_est - depth_gt).abs(), mask)
+            extra["{}/raw_abs_error".format(stage_key)] = (
+                raw_abs_error.detach())
+            extra["{}/refined_abs_error".format(stage_key)] = (
+                refined_abs_error.detach())
             extra["{}/raw_to_refined_error_delta".format(stage_key)] = (
                 raw_abs_error - refined_abs_error).detach()
             improved = (
@@ -946,6 +1010,11 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 < (depth_raw - depth_gt).abs())
             extra["{}/refined_improved_pixel_ratio".format(stage_key)] = (
                 masked_mean(improved.float(), mask).detach())
+            worsened = (
+                (depth_est - depth_gt).abs()
+                > (depth_raw - depth_gt).abs())
+            extra["{}/refined_worsened_pixel_ratio".format(stage_key)] = (
+                masked_mean(worsened.float(), mask).detach())
             if effective_safe_refine_loss_weight > 0:
                 safe_refine_loss = masked_mean(
                     F.relu(
@@ -963,6 +1032,9 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         if "depth_residual" in stage_inputs:
             extra["{}/mean_abs_depth_residual".format(stage_key)] = masked_mean(
                 stage_inputs["depth_residual"].abs(), mask).detach()
+        if "raw_depth_residual" in stage_inputs:
+            extra["{}/mean_abs_raw_residual".format(stage_key)] = masked_mean(
+                stage_inputs["raw_depth_residual"].abs(), mask).detach()
         if "geometry_gate" in stage_inputs:
             extra["{}/geometry_gate_mean".format(stage_key)] = masked_mean(
                 stage_inputs["geometry_gate"], mask).detach()
@@ -970,6 +1042,66 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 gate_loss = masked_mean(stage_inputs["geometry_gate"], mask)
                 total_loss += effective_gate_loss_weight * gate_loss
                 extra["{}/gate_loss".format(stage_key)] = gate_loss.detach()
+        benefit_gate = stage_inputs.get(
+            "benefit_gate", stage_inputs.get("geometry_gate", None))
+        if benefit_gate is not None:
+            extra["{}/benefit_gate_mean".format(stage_key)] = masked_mean(
+                benefit_gate, mask).detach()
+        raw_residual = stage_inputs.get("raw_depth_residual", None)
+        depth_interval = stage_inputs.get("depth_interval", None)
+        if (depth_raw is not None and raw_residual is not None
+                and benefit_gate is not None and depth_interval is not None):
+            residual_target = bounded_residual_target(
+                depth_raw, depth_gt, depth_interval, residual_target_ratio)
+            benefit_target = residual_benefit_target(
+                depth_raw, raw_residual, depth_gt, depth_interval,
+                benefit_margin_ratio)
+            residual_target_loss = F.smooth_l1_loss(
+                raw_residual[mask], residual_target[mask], reduction="mean")
+            gate_benefit_loss = balanced_binary_cross_entropy(
+                benefit_gate, benefit_target, mask)
+            total_loss += (
+                effective_residual_target_loss_weight
+                * residual_target_loss)
+            total_loss += (
+                effective_gate_benefit_loss_weight * gate_benefit_loss)
+            extra["{}/residual_target_loss".format(stage_key)] = (
+                residual_target_loss.detach())
+            extra["{}/gate_benefit_loss".format(stage_key)] = (
+                gate_benefit_loss.detach())
+            nonzero_target = residual_target.abs() > 1e-6
+            sign_correct = (
+                torch.sign(raw_residual) == torch.sign(residual_target))
+            sign_mask = mask & nonzero_target
+            extra["{}/residual_sign_accuracy".format(stage_key)] = (
+                masked_mean(sign_correct.float(), sign_mask).detach())
+            actual_improved = (
+                (depth_est - depth_gt).abs()
+                < (depth_raw - depth_gt).abs())
+            actual_worsened = (
+                (depth_est - depth_gt).abs()
+                > (depth_raw - depth_gt).abs())
+            extra["{}/gate_on_improved_mean".format(stage_key)] = (
+                masked_mean(benefit_gate, mask & actual_improved).detach())
+            extra["{}/gate_on_worsened_mean".format(stage_key)] = (
+                masked_mean(benefit_gate, mask & actual_worsened).detach())
+            predicted_benefit = benefit_gate >= 0.5
+            true_positive = mask & predicted_benefit & benefit_target
+            predicted_positive = mask & predicted_benefit
+            target_positive = mask & benefit_target
+            extra["{}/gate_precision".format(stage_key)] = (
+                true_positive.float().sum()
+                / (predicted_positive.float().sum() + 1e-6)).detach()
+            extra["{}/gate_recall".format(stage_key)] = (
+                true_positive.float().sum()
+                / (target_positive.float().sum() + 1e-6)).detach()
+        for uncertainty_key in (
+                "probability_entropy", "depth_variance",
+                "top1_top2_margin"):
+            if uncertainty_key in stage_inputs:
+                extra["{}/{}_mean".format(
+                    stage_key, uncertainty_key)] = masked_mean(
+                        stage_inputs[uncertainty_key], mask).detach()
         if "region_a" in stage_inputs:
             extra["{}/region_A_ratio".format(stage_key)] = masked_mean(
                 stage_inputs["region_a"].float(), mask).detach()
