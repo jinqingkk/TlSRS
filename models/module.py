@@ -1089,6 +1089,8 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
             true_positive = mask & predicted_benefit & benefit_target
             predicted_positive = mask & predicted_benefit
             target_positive = mask & benefit_target
+            extra["{}/benefit_target_positive_ratio".format(stage_key)] = (
+                masked_mean(benefit_target.float(), mask).detach())
             extra["{}/gate_precision".format(stage_key)] = (
                 true_positive.float().sum()
                 / (predicted_positive.float().sum() + 1e-6)).detach()

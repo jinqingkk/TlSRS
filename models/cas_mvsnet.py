@@ -241,10 +241,19 @@ class CascadeMVSNet(nn.Module):
 
             depth_raw = outputs_stage["depth"]
             ref_feature = features_stage[0]
+            run_sger = self.use_sger or (
+                self.use_sger_lite and stage_idx == self.num_stage - 1)
+            isolate_sger_lite = (
+                self.use_sger_lite and stage_idx == self.num_stage - 1)
             run_normal_head = (not self.use_sger_lite) or (stage_idx == self.num_stage - 1)
             if run_normal_head:
                 depth_input = depth_raw.unsqueeze(1)
                 confidence_input = outputs_stage["photometric_confidence"].unsqueeze(1)
+                normal_feature = ref_feature
+                if isolate_sger_lite:
+                    normal_feature = normal_feature.detach()
+                    depth_input = depth_input.detach()
+                    confidence_input = confidence_input.detach()
                 if depth_input.shape[-2:] != ref_feature.shape[-2:]:
                     depth_input = F.interpolate(depth_input, size=ref_feature.shape[-2:],
                                                 mode='bilinear',
@@ -253,20 +262,24 @@ class CascadeMVSNet(nn.Module):
                     confidence_input = F.interpolate(confidence_input, size=ref_feature.shape[-2:],
                                                      mode='bilinear',
                                                      align_corners=Align_Corners_Range)
-                normal_input = torch.cat([ref_feature, depth_input, confidence_input], dim=1)
+                normal_input = torch.cat([
+                    normal_feature, depth_input, confidence_input], dim=1)
                 outputs_stage["normal"] = self.normal_head[stage_idx](normal_input)
 
-            run_sger = self.use_sger or (self.use_sger_lite and stage_idx == self.num_stage - 1)
             if run_sger:
                 ref_img_stage = F.interpolate(
                     imgs[:, 0], size=depth_raw.shape[-2:],
                     mode='bilinear', align_corners=Align_Corners_Range)
                 intrinsics_stage = proj_matrices_stage[:, 0, 1, :3, :3]
+                sger_backbone_feature = (
+                    ref_feature.detach()
+                    if isolate_sger_lite else ref_feature)
                 if self.sger_share:
-                    sger_feature = self.sger_feature_adapters[stage_idx](ref_feature)
+                    sger_feature = self.sger_feature_adapters[stage_idx](
+                        sger_backbone_feature)
                     sger_block = self.shared_sger
                 else:
-                    sger_feature = ref_feature
+                    sger_feature = sger_backbone_feature
                     sger_block = self.sger_blocks[0 if self.use_sger_lite else stage_idx]
                 stage_interval = (
                     self.depth_interals_ratio[stage_idx] * depth_interval)
@@ -276,10 +289,14 @@ class CascadeMVSNet(nn.Module):
                         stage_interval * stage_interval + 1e-6),
                     outputs_stage["top1_top2_margin"],
                 ], dim=1)
+                if isolate_sger_lite:
+                    uncertainty = uncertainty.detach()
                 sger_outputs = sger_block(
                     depth_raw.detach(),
                     outputs_stage["normal"],
-                    outputs_stage["photometric_confidence"],
+                    outputs_stage["photometric_confidence"].detach()
+                    if isolate_sger_lite
+                    else outputs_stage["photometric_confidence"],
                     ref_img_stage,
                     intrinsics_stage,
                     sger_feature,
@@ -297,8 +314,10 @@ class CascadeMVSNet(nn.Module):
                 outputs_stage["residual_ratio"] = (
                     self.sger_residual_scale
                     * sger_outputs["residual_ratio"])
+                refined_depth_base = (
+                    depth_raw.detach() if isolate_sger_lite else depth_raw)
                 outputs_stage["depth_refined"] = (
-                    depth_raw + effective_residual)
+                    refined_depth_base + effective_residual)
                 outputs_stage["depth"] = outputs_stage["depth_refined"]
                 outputs_stage["sger_residual_scale"] = depth_raw.new_tensor(
                     self.sger_residual_scale)

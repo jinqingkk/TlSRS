@@ -270,6 +270,42 @@ def test_cascade_sger_lite_scales_effective_residual():
     assert "sger_residual_scale" not in model.state_dict()
 
 
+def test_cascade_sger_lite_refined_path_isolates_backbone_gradients():
+    torch.manual_seed(7)
+    model = CascadeMVSNet(
+        ndepths=[8, 8, 8],
+        depth_interals_ratio=[4, 2, 1],
+        use_sger_lite=True,
+        sger_hidden_channels=16,
+        sger_gate_channels=8,
+    )
+    model.train()
+    with torch.no_grad():
+        model.sger_blocks[0].residual.output.weight.fill_(0.01)
+        model.sger_blocks[0].residual.output.bias.fill_(0.2)
+    imgs = torch.rand(2, 3, 3, 32, 32)
+    depth_values = torch.linspace(1.0, 2.0, 8).view(1, 8).repeat(2, 1)
+    proj_matrices = {
+        key: _identity_proj(2, 3)
+        for key in ("stage1", "stage2", "stage3")
+    }
+
+    outputs = model(imgs, proj_matrices, depth_values)
+    outputs["stage3"]["depth_refined"].mean().backward()
+
+    backbone_parameters = list(model.feature.parameters())
+    backbone_parameters += list(model.cost_regularization.parameters())
+    assert all(parameter.grad is None for parameter in backbone_parameters)
+    assert any(
+        parameter.grad is not None
+        and parameter.grad.abs().sum().item() > 0
+        for parameter in model.normal_head[2].parameters())
+    assert any(
+        parameter.grad is not None
+        and parameter.grad.abs().sum().item() > 0
+        for parameter in model.sger_blocks[0].parameters())
+
+
 def test_cascade_sger_residual_scale_rejects_invalid_values():
     model = CascadeMVSNet(
         ndepths=[8, 8, 8],
@@ -489,6 +525,8 @@ def test_sger_benefit_supervision_reports_selective_refinement_metrics():
         extra["stage1/gate_on_worsened_mean"], torch.tensor(0.2))
     assert torch.allclose(
         extra["stage1/residual_sign_accuracy"], torch.tensor(0.5))
+    assert torch.allclose(
+        extra["stage1/benefit_target_positive_ratio"], torch.tensor(0.5))
     assert "stage1/residual_target_loss" in extra
     assert "stage1/gate_benefit_loss" in extra
     total.backward()
@@ -1020,6 +1058,7 @@ if __name__ == "__main__":
     test_cascade_sger_returns_raw_and_refined_depth_for_every_stage()
     test_cascade_sger_lite_refines_stage3_only()
     test_cascade_sger_lite_scales_effective_residual()
+    test_cascade_sger_lite_refined_path_isolates_backbone_gradients()
     test_cascade_sger_residual_scale_rejects_invalid_values()
     test_cascade_disabled_path_has_no_sger_only_outputs()
     test_cascade_shared_sger_mode_runs_all_stages()
