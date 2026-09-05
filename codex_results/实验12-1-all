@@ -1,0 +1,115 @@
+这次得到的不是原始全阶段 SGER，而是“全阶段 SGER 架构 + 新实验12损失和参数”的混合版本。
+
+  具体生效情况如下。
+
+  ## 网络前向结构
+
+  因为训练时使用了 --use_sger，所以三个阶段都运行：
+
+  Stage1: DepthNet → NormalHead → SGERBlock → refined depth
+  Stage2: DepthNet → NormalHead → SGERBlock → refined depth
+  Stage3: DepthNet → NormalHead → SGERBlock → refined depth
+
+  而且：
+
+  - Stage1 refined depth 会作为 Stage2 深度采样中心；
+  - Stage2 refined depth 会作为 Stage3 深度采样中心；
+  - 默认 detach_refined_feedback=True，跨阶段采样中心不反传梯度；
+  - 最终输出使用 Stage3 refined depth。
+
+  这部分仍是原全阶段 SGER 的结构，不是实验12的 Stage3-only 结构。
+
+  ## 实验12中对它生效的修改
+
+  ### 1. 三个阶段的残差上限都降低了
+
+  训练输出已经显示：
+
+  sger_max_residual_ratio = 0.25
+
+  所以每个阶段都是：
+
+  最大残差 = 0.25 × 当前阶段 depth interval
+
+  不是旧全阶段 SGER 使用的 0.5 或 2.0。
+
+  ### 2. 三个阶段都加入了 gate 稀疏损失
+
+  因为全阶段的每个 stage 都有 geometry_gate，所以都会计算：
+
+  L_gate = mean(geometry_gate)
+
+  默认权重：
+
+  gate_loss_weight = 0.001
+
+  当前 gate loss 没有 stage 衰减，因此 Stage1、Stage2、Stage3 都直接使用 0.001。
+
+  ### 3. 三个阶段都加入了 safe-refine 损失
+
+  每个阶段都比较：
+
+  raw depth error
+  refined depth error
+
+  如果 refined 比 raw 更差，就计算：
+
+  L_safe = relu(err_refined - err_raw)
+
+  默认权重：
+
+  safe_refine_loss_weight = 0.1
+
+  raw error 已做梯度分离，因此该损失只推动 refined 分支改进，不会通过破坏 raw depth 来降低损失。
+
+  该损失同样没有 stage 衰减，所以三个阶段都使用 0.1。
+
+  ### 4. residual loss 权重提高
+
+  当前使用：
+
+  residual_loss_weight = 0.01
+
+  但 residual loss 保留了 stage 衰减：
+
+  Stage1: 0.01
+  Stage2: 0.005
+  Stage3: 0.0025
+
+  ### 5. raw/refined depth 同时监督
+
+  每个阶段都计算：
+
+  1.0 × raw depth loss
+  + 1.0 × refined depth loss
+
+  再乘原来的多阶段深度权重：
+
+  Stage1: 0.5
+  Stage2: 1.0
+  Stage3: 2.0
+
+  ## 没有生效的实验12修改
+
+  以下功能只在 --use_sger_lite 下生效，因此这次全阶段训练没有使用：
+
+  - 前 8 个 epoch 冻结主干；
+  - SGER 分支和主干的双参数组；
+  - 主干 0.1× 学习率。
+
+  checkpoint 中只有：
+
+  name = model
+
+  ## 置信度校准
+
+  温和残差置信度校准只发生在测试导出阶段，不影响该 checkpoint 的训练：
+  floor = 0.5
+
+  用当前 test.py 测试这个全阶段 checkpoint 时，仍然可以生成温和校准置信度。
+
+  因此，这次模型可以定义为：
+
+  实验12损失约束下的全阶段 SGER-CasMVSNet
+
+  它不是原来的全阶段实验，也不是要求的实验12 Stage3-only 实验。结果仍有消融价值，但需要单独命名，不能和正式实验12直接混为一组。

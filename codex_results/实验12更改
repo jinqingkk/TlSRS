@@ -1,0 +1,205 @@
+ 这次修改没有新增网络模块，也没有改变 CasMVSNet 的 cost volume、深度采样或 Stage3-only SGER-Lite 拓扑。
+ 核心目标是把实验11中过度开放的 SGER refinement 收紧为更安全、局部的修正。
+
+  ## 1. 收紧 Stage3 深度残差
+
+  SGER-Lite 仍然只在 Stage3 运行：
+
+  Stage1 raw depth
+    → Stage2 raw depth
+    → Stage3 raw depth
+    → NormalHead + SGERBlock
+    → refined depth
+
+  最大残差范围从：
+
+  0.5 × Stage3 depth interval
+
+  降低为：
+
+  0.25 × Stage3 depth interval
+
+  对应默认参数：
+
+  --sger_max_residual_ratio 0.25
+
+  Stage1、Stage2 不运行 NormalHead/SGER，也不使用 refined depth 作为后续深度搜索中心。
+
+  ## 2. 新增 geometry gate 稀疏损失
+
+  实验11的 geometry_gate_mean≈0.72，说明残差在过大范围内生效。
+
+  现在增加：
+
+  L_gate = mean(geometry_gate)
+
+  只统计有效 GT 深度像素，并直接加入总损失：
+
+  L_total += gate_loss_weight × L_gate
+
+  默认配置：
+
+  --gate_loss_weight 0.001
+
+  训练新增指标：
+
+  stage3/gate_loss
+  stage3/geometry_gate_mean
+
+  它不会硬性裁剪 gate，而是通过训练促使 SGER 只在必要区域开放。
+
+  ## 3. 新增安全 refinement 损失
+
+  现在显式比较 refined depth 和 raw depth 的误差：
+
+  err_raw     = |depth_raw - depth_gt|
+  err_refined = |depth_refined - depth_gt|
+
+  L_safe = mean(
+      relu(err_refined - err_raw + margin)
+  )
+
+  含义：
+
+  - refined 优于或等于 raw：不惩罚；
+  - refined 比 raw 更差：按退化量进行惩罚；
+  - 只统计有效 GT 像素。
+
+  默认参数：
+
+  --safe_refine_loss_weight 0.1
+  --safe_refine_margin 0.0
+
+  训练新增指标：
+
+  stage3/safe_refine_loss
+  stage3/raw_to_refined_error_delta
+
+  其中 raw_to_refined_error_delta：
+
+  - 正值：refined 优于 raw；
+  - 负值：refined 比 raw 更差。
+
+  另外，err_raw 在安全损失中进行了梯度分离。安全损失只能推动 refined 分支改进，不能通过故意增大 raw depth 误差来降低损失。
+
+  ## 4. 加强原有 residual 正则
+
+  归一化残差正则权重从：
+
+  --residual_loss_weight 0.005
+
+  提高为：
+
+  --residual_loss_weight 0.01
+
+  它继续约束：
+
+  |gated residual| / depth interval
+
+  与较小的最大残差范围、gate loss 一起抑制过度修正。
+
+  ## 5. 修改两阶段训练策略（摒弃）
+
+  SGER-Lite 默认冻结主干时间从需要手动配置改为：
+
+  --freeze_backbone_epochs 8
+
+  前 8 个 epoch：
+
+  - 冻结 FeatureNet、DepthNet、CostRegNet 等主干；
+  - 只训练 Stage3 NormalHead 和 SGERBlock。
+
+  第 8 个 epoch 后：
+
+  - 自动解冻主干；
+  - 不重建 optimizer；
+  - 保留已有优化器和学习率调度状态。
+
+  ## 6. 新增主干低学习率参数组（摒弃）
+
+  SGER-Lite 的优化器现在分成两组：
+
+  Stage3 NormalHead + SGERBlock
+      learning rate = base_lr
+
+  CasMVSNet backbone
+      learning rate = base_lr × 0.1
+
+  默认参数：
+
+  --backbone_lr_scale 0.1
+
+  训练日志同时输出两个参数组的实际学习率，例如：
+
+  lr sger_lite=0.001000,backbone=0.000100
+
+  非 SGER-Lite 模式仍使用原来的单参数组训练方式。
+
+  ## 7. 温和化残差置信度校准
+
+  实验11原公式为：
+
+  confidence_calibrated
+      = confidence × exp(-residual_ratio)
+
+  该公式导致约 21% 点云被过滤。
+
+  现在改为：
+
+  scale =
+      floor
+      + (1 - floor) × exp(-alpha × residual_ratio)
+
+  confidence_calibrated =
+      clip(confidence × scale, 0, 1)
+
+  默认参数：
+
+  --confidence_residual_alpha 0.25
+  --confidence_residual_floor 0.5
+
+  效果：
+
+  - residual 为 0 时不降低置信度；
+  - residual 越大，置信度越低；
+  - 缩放系数不会低于 0.5；
+  - 避免校准置信度过度删除点云；
+  - 对非法 alpha 和 floor 参数增加检查。
+
+  ## 8. 保留三套评估路径
+
+  推理继续同时导出：
+
+  depth_est/                         refined depth
+  depth_est_raw/                     raw depth
+  confidence/                        raw photometric confidence
+  confidence_residual_calibrated/    温和校准置信度
+
+  仍可评估：
+
+  A: refined depth + raw confidence
+  B: refined depth + calibrated confidence
+  C: raw depth + raw confidence
+
+  默认保持实验11中最可靠的配置：
+
+  --fusion_depth_source raw
+  --fusion_confidence_source raw
+
+  ## 9. 实验12当前关键默认值
+
+  sger_max_residual_ratio       = 0.25
+  raw_depth_loss_weight         = 1.0
+  refined_depth_loss_weight     = 1.0
+  residual_loss_weight          = 0.01
+  gate_loss_weight              = 0.001
+  safe_refine_loss_weight       = 0.1
+  safe_refine_margin            = 0.0
+  freeze_backbone_epochs        = 8
+  backbone_lr_scale             = 0.1
+  confidence_residual_alpha     = 0.25
+  confidence_residual_floor     = 0.5
+  fusion_depth_source           = raw
+  fusion_confidence_source      = raw
+
+  总体上，这次修改把 SGER-Lite 从“大范围学习残差”调整为“受 gate 稀疏性、残差幅度和 raw-depth 安全基准共同约束的 Stage3 局部修正器”。

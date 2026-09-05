@@ -1,0 +1,424 @@
+# 实验15：主干稳定训练与受控收益细化方案
+
+## 一、实验15目标
+
+实验15继续以自几何与边缘细化残差-CasMVSNet网络（SGER-CasMVSNet）为研究主体，但首先修复实验14中错误的主干冻结调度，恢复并保护 CasMVSNet raw depth 的质量；
+随后分别验证 Residual Proposal 和 Benefit Gate，最终使同一 checkpoint 下的 SGER refined depth 同时降低 DTU 的精确度误差（Acc.）和完整度误差（Comp.）。
+
+实验15不删除 SGER，也不把 raw 路径作为最终研究架构。raw depth + raw confidence 只作为受保护的主干、对照组和临时融合回退。实验15的最终目标仍然是：
+
+refined Acc. < raw Acc.
+
+refined Comp. < raw Comp.
+
+refined Overall < raw Overall
+
+三项指标均为越低越好。
+
+
+## 二、实验14结果与实验13对比
+
+四个 DTU 场景的平均结果如下：
+
+设置                              Acc.      Comp.     Overall
+实验13 Epoch12 raw               0.2835    0.3468    0.3152
+实验14 Epoch12 raw               0.2889    0.3887    0.3388
+实验14 Epoch15 raw               0.2923    0.3884    0.3404
+实验14 Epoch15 refined           0.2981    0.3932    0.3457
+实验14 Epoch15 calibrated        0.2967    0.3967    0.3467
+
+实验14最佳结果是 Epoch12 raw，仍比实验13 Epoch12 raw差：
+
+Acc.：增加0.0054，恶化约1.9%；
+Comp.：增加0.0419，恶化约12.1%；
+Overall：增加0.0236，恶化约7.5%。
+
+因此实验14的主要退化来自完整度，而不是单纯精确度。
+
+点云数量也支持这一结论。Epoch12 raw点云总数从实验13的24,149,584下降到实验14的22,871,748，减少约5.29%。其中：
+
+Scan49：4,639,995下降到4,086,475，减少约11.9%；
+Scan118：6,943,513下降到6,638,256，减少约4.4%。
+
+对应的完整度误差为：
+
+Scan49 Comp.：0.5795上升到0.6574；
+Scan118 Comp.：0.4443上升到0.5136。
+
+实验14完整度恶化主要集中在Scan49和Scan118，说明较多有效区域没有通过光度或几何一致性筛选，最终点云覆盖不足。
+
+
+## 三、实验14退化的主要原因
+
+### 1. 主干冻结调度与设计目标相反
+
+实验14训练指标如下：
+
+指标                              Epoch0    Epoch3    Epoch6    Epoch9    Epoch12   Epoch15
+abs_depth_error                   4.996     80.33     81.90     79.91     7.00      5.02
+geometry_mask_ratio               0.541     0.003     0.012     0.002     0.486     0.546
+mean_abs_depth_residual           0.245     0         0         0         0.150     0.260
+
+Epoch3至Epoch9期间残差为0，因此这一阶段接近80的深度误差不能归因于SGER残差改变了输出，而是raw backbone自身发生了退化。
+
+实验14代码默认使用：
+
+freeze_backbone_epochs = 8
+backbone_lr_scale = 0.1
+sger_warmup_start_epoch = 7
+sger_warmup_end_epoch = 10
+
+当前冻结逻辑在Epoch0至Epoch7直接把所有非SGER参数设为requires_grad=False，但每个训练batch仍执行model.train()。
+因此卷积权重虽然被冻结，FeatureNet和CostRegNet中的BatchNorm running mean与running variance仍会更新。
+
+结果表现为：
+
+（1）Epoch0的BatchNorm统计尚未明显漂移，误差正常；
+（2）Epoch3至Epoch7权重不能适应数据，但BatchNorm统计持续变化，raw depth崩溃；
+（3）Epoch8解冻后backbone重新开始学习；
+（4）Epoch12至Epoch15深度误差才逐渐恢复。
+
+实验14原设计要求Epoch0至Epoch3先建立raw backbone，Epoch4之后再隔离refiner训练；实际实现却冻结了Epoch0至Epoch7，实施顺序与设计相反。这是实验14首先必须修复的根因。
+
+### 2. SGER细化仍然是负贡献
+
+实验14 Epoch15同一checkpoint下：
+
+raw：      0.2923 / 0.3884 / 0.3404
+refined：  0.2981 / 0.3932 / 0.3457
+
+refined同时恶化Acc.、Comp.和Overall，说明Benefit-Supervised SGER还没有成为可靠的选择性修正器。
+
+训练后期也出现：
+
+refined_improved_pixel_ratio：Epoch12为0.625，Epoch15下降到0.487；
+mean_abs_depth_residual：Epoch12为0.150，Epoch15上升到0.260。
+
+这说明训练后期残差变大，但改善像素比例反而下降。可能原因包括残差方向再次失准、Benefit Gate区分能力不足或大面积开放。该判断需要补齐Gate与残差诊断量后验证，不能直接通过同时修改多个损失来猜测。
+
+### 3. 实验14缺少关键诊断指标
+
+实验14结果没有记录以下已经实现的指标：
+
+stage3/raw_abs_error
+stage3/refined_abs_error
+stage3/raw_to_refined_error_delta
+stage3/refined_worsened_pixel_ratio
+stage3/mean_abs_raw_residual
+stage3/benefit_gate_mean
+stage3/gate_on_improved_mean
+stage3/gate_on_worsened_mean
+stage3/gate_precision
+stage3/gate_recall
+stage3/residual_sign_accuracy
+
+因此目前无法确定主要问题来自Residual Proposal还是Benefit Gate。实验15必须完整记录这些指标。
+
+### 4. residual calibrated confidence没有带来收益
+
+实验14中：
+
+Epoch15 refined + raw confidence：overall = 0.3457；
+Epoch15 refined + calibrated confidence：overall = 0.3467；
+Epoch12 refined + raw confidence：overall = 0.3573；
+Epoch12 refined + calibrated confidence：overall = 0.3588。
+
+校准置信度略微改变Acc.，但继续恶化Comp.和Overall。因此实验15训练诊断阶段统一使用raw confidence，不再修改置信度校准公式。
+
+
+## 四、实验15总体原则
+
+实验15按顺序解决三个问题：
+
+第一，保证raw backbone从零训练时稳定收敛；
+
+第二，保证Residual Proposal学习正确方向和受限幅度；
+
+第三，保证Benefit Gate只在提议能够产生真实收益的位置开放。
+
+固定不变的内容：
+
+（1）仅Stage3运行NormalHead与SGERBlock；
+（2）Stage1和Stage2保持CasMVSNet raw cascade；
+（3）Stage1至Stage2、Stage2至Stage3的搜索中心均为raw depth；
+（4）SGER输入的Stage3 depth_raw继续detach；
+（5）保留entropy、depth variance和top1-top2 margin；
+（6）raw depth + raw confidence作为对照和临时默认融合输出；
+（7）固定训练数据、测试列表、随机种子和DTU融合协议；
+（8）不同时修改融合阈值、网络容量和多阶段SGER结构。
+
+
+## 五、实验15-A：验证主干冻结根因
+
+### 1. 唯一变量
+
+保持实验14其他配置不变，仅设置：
+
+freeze_backbone_epochs = 0
+
+这组实验的目的不是直接获得最终结果，而是验证Epoch3至Epoch9的崩溃是否由错误冻结和BatchNorm漂移引起。
+
+### 2. 推荐命令
+
+bash train.sh \
+  1 \
+  ./checkpoints/experiment15_a_no_early_freeze \
+  --ndepths "48,32,8" \
+  --depth_inter_r "4,2,1" \
+  --dlossw "0.5,1.0,2.0" \
+  --batch_size 2 \
+  --eval_freq 3 \
+  --seed 1 \
+  --use_sger_lite \
+  --sger_max_residual_ratio 0.25 \
+  --raw_depth_loss_weight 1.0 \
+  --refined_depth_loss_weight 1.0 \
+  --residual_loss_weight 0.01 \
+  --gate_loss_weight 0.0 \
+  --safe_refine_loss_weight 0.1 \
+  --safe_refine_margin 0.0 \
+  --residual_target_loss_weight 0.05 \
+  --gate_benefit_loss_weight 0.05 \
+  --residual_target_ratio 0.25 \
+  --benefit_margin_ratio 0.05 \
+  --freeze_backbone_epochs 0 \
+  --backbone_lr_scale 0.1 \
+  --sger_warmup_start_epoch 7 \
+  --sger_warmup_end_epoch 10
+
+不要使用--loadckpt，继续保持从零训练。
+
+### 3. 根因确认标准
+
+满足以下条件即可确认实验14早期退化主要来自冻结实现：
+
+（1）Epoch3、Epoch6和Epoch9的abs_depth_error不再接近80；
+（2）geometry_mask_ratio保持在约0.45至0.56，不再下降到0.002附近；
+（3）Epoch0至Epoch9的raw_depth_loss总体下降，没有长时间平台性崩溃；
+（4）Epoch12 raw overall明显优于实验14的0.3388。
+
+如果实验15-A仍出现约80的误差，则检查数据加载、学习率和BatchNorm统计，而不是继续调整SGER损失。
+
+
+## 六、实验15-B：正确的分阶段训练调度
+
+实验15-A确认根因后，再实现真正符合设计目标的区间式冻结调度。不能继续使用“冻结前N个epoch”的单阈值逻辑。
+
+### 1. 推荐调度
+
+Epoch 0至3：Raw Backbone建立阶段
+
+backbone：正常训练，学习率倍率1.0；
+NormalHead和SGER：允许前向；
+residual target loss scale：0；
+gate benefit loss scale：0；
+SGER residual scale beta：0；
+最终深度等于raw depth。
+
+Epoch 4至6：Residual Proposal阶段
+
+backbone参数冻结；
+backbone中的BatchNorm必须进入eval模式并固定running statistics；
+NormalHead和Residual Proposal正常训练；
+residual target loss scale：1；
+gate benefit loss scale：0；
+SGER residual scale beta：0；
+最终深度仍等于raw depth。
+
+Epoch 7至10：Benefit Gate阶段
+
+backbone继续冻结且BatchNorm保持eval；
+Residual Proposal继续训练；
+Benefit Gate开始训练；
+gate benefit loss scale从0.25、0.50、0.75增加到1.0；
+SGER residual scale beta同步从0.25增加到1.0。
+
+Epoch 11至15：受保护联合微调阶段
+
+backbone解冻；
+backbone学习率倍率0.1；
+SGER学习率倍率1.0；
+residual target和gate benefit loss scale均为1；
+SGER residual scale beta为1；
+继续同时监督raw depth和refined depth。
+
+### 2. BatchNorm处理要求
+
+冻结backbone时必须同时满足：
+
+（1）非SGER参数requires_grad=False；
+（2）FeatureNet、CostRegNet和raw depth路径中的BatchNorm使用eval模式；
+（3）NormalHead和SGERBlock仍保持train模式；
+（4）解冻backbone后恢复其BatchNorm训练模式。
+
+仅设置requires_grad=False不足以冻结BatchNorm统计。
+
+### 3. raw backbone通过标准
+
+实验15-B进入SGER最终评估前，raw结果至少满足：
+
+Acc. <= 0.2835
+Comp. <= 0.3468
+Overall <= 0.3152
+
+即不低于实验13 Epoch12 raw。如果raw结果仍明显差于实验13，不进入融合阈值搜索，也不把问题归因于点云后处理。
+
+
+## 七、实验15-C：收紧SGER的单变量消融
+
+只有实验15-B恢复raw backbone后，才继续判断SGER。
+
+### 1. 根据诊断结果选择唯一改动
+
+情况A：residual_sign_accuracy < 0.70
+
+结论：Residual Proposal方向仍不可靠。
+
+下一组只提高residual_target_loss_weight：
+
+0.05 -> 0.10
+
+Gate权重、残差范围、融合阈值全部不变。
+
+情况B：residual_sign_accuracy >= 0.70，但gate_on_improved_mean与gate_on_worsened_mean差值小于0.20
+
+结论：Residual Proposal可用，但Benefit Gate没有区分收益区域。
+
+下一组只加入弱Gate预算：
+
+L_gate_budget = relu(mean(benefit_gate) - 0.25)^2
+
+推荐权重0.01，限制平均Gate不超过约0.25。该预算不能替代benefit supervision。
+
+情况C：残差方向和Gate区分均达标，但refined仍差于raw
+
+结论：有效修正幅度过大或DTU边界区域被过度移动。
+
+下一组只缩小最大残差：
+
+sger_max_residual_ratio：0.25 -> 0.10
+residual_target_ratio：0.25 -> 0.10
+
+两个比例必须同步修改，避免网络输出范围与监督目标范围不一致。
+
+### 2. 不允许同时进行的改动
+
+实验15-C禁止同时修改：
+
+（1）residual target权重；
+（2）Benefit Gate损失；
+（3）最大残差范围；
+（4）置信度校准；
+（5）光度或几何融合阈值。
+
+每一组只验证一个假设，结果不达标时回到诊断指标重新判断。
+
+
+## 八、实验15必须记录的训练与验证指标
+
+每个Epoch至少记录：
+
+stage3/raw_depth_loss
+stage3/refined_depth_loss
+stage3/raw_abs_error
+stage3/refined_abs_error
+stage3/raw_to_refined_error_delta
+stage3/refined_improved_pixel_ratio
+stage3/refined_worsened_pixel_ratio
+stage3/mean_abs_raw_residual
+stage3/mean_abs_depth_residual
+stage3/residual_sign_accuracy
+stage3/benefit_gate_mean
+stage3/gate_on_improved_mean
+stage3/gate_on_worsened_mean
+stage3/gate_precision
+stage3/gate_recall
+stage3/probability_entropy_mean
+stage3/depth_variance_mean
+stage3/top1_top2_margin_mean
+geometry_mask_ratio
+sger_residual_scale
+effective_residual_target_loss_weight
+effective_gate_benefit_loss_weight
+
+另外增加按区域统计：
+
+edge/raw_abs_error
+edge/refined_abs_error
+non_edge/raw_abs_error
+non_edge/refined_abs_error
+high_uncertainty/gate_mean
+low_uncertainty/gate_mean
+
+这样可以确定SGER改善发生在边缘、平面还是高不确定性区域。
+
+
+## 九、固定导出与点云融合协议
+
+Epoch12和Epoch15均导出三组：
+
+A：refined depth + raw confidence
+B：refined depth + residual calibrated confidence
+C：raw depth + raw confidence
+
+训练诊断和主要结论优先比较A与C；B只保留为置信度消融，不作为默认输出。
+
+每组每个场景记录：
+
+Acc.
+Comp.
+Overall
+point_count
+photometric_mask_ratio
+geometric_mask_ratio
+final_mask_ratio
+view_consistency_count_distribution
+
+实验15-A至15-C期间固定：
+
+conf = 0.9
+thres_view = 当前实验13/14使用值
+几何重投影阈值 = 当前实验13/14使用值
+
+在refined depth已经优于raw depth之前，不调整融合阈值。
+
+
+## 十、SGER进入最终点云评估的条件
+
+代码和验证集层面必须同时满足：
+
+（1）raw_to_refined_error_delta > 0；
+（2）refined_improved_pixel_ratio >= 0.60；
+（3）refined_worsened_pixel_ratio <= 0.35；
+（4）residual_sign_accuracy >= 0.70；
+（5）gate_on_improved_mean - gate_on_worsened_mean >= 0.20；
+（6）beta增加时raw depth指标不发生突跳；
+（7）Epoch15的改善不能明显低于Epoch12。
+
+DTU四场景最低要求：
+
+refined Acc. < 同checkpoint raw Acc.
+refined Comp. < 同checkpoint raw Comp.
+refined Overall < 同checkpoint raw Overall
+
+实验15目标值：
+
+raw Overall <= 0.3152
+refined Overall <= 0.3100
+
+目标不是只依靠减少点数降低Acc.，也不是只依靠增加点数降低Comp.，而是在相同融合协议下同时降低两项误差。
+
+
+## 十一、最终执行顺序
+
+第一步：运行实验15-A，只把freeze_backbone_epochs改为0，验证实验14崩溃根因。
+
+第二步：实现实验15-B的区间冻结和BatchNorm固定，恢复实验13级别的raw backbone。
+
+第三步：根据residual_sign_accuracy和Gate区分度选择实验15-C的一个单变量改动。
+
+第四步：确认refined depth在相同raw confidence下同时优于raw depth。
+
+第五步：网络结果稳定后，才小范围搜索融合参数，以进一步同时降低Acc.和Comp.。
+
+实验15最重要的研究结论应围绕SGER独立贡献展开：CasMVSNet提供稳定的多视图raw depth，SGER通过受监督残差方向、收益选择门控、自几何和边缘线索，在不破坏主干的条件下对高收益区域进行局部修正，最终使refined输出优于raw对照。

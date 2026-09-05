@@ -1,0 +1,321 @@
+# 实验15-B：恢复Backbone学习率的单变量验证
+
+## 一、更正后的实验15-A结论
+
+实验15-A成功解决了实验14 Epoch 3至Epoch 9的训练崩溃，并显著改善了最终DTU重建结果。取消早期冻结不仅改善训练稳定性，也恢复了大部分raw backbone的点云精度和完整度。
+
+实验15-A证明：实验14前8个Epoch冻结非SGER参数，是早期深度崩溃和最终重建质量下降的主要原因之一。
+
+但是，实验15-A仍略差于实验13的最佳raw结果，而且SGER残差方向与Benefit Gate尚未达到有效细化标准。因此实验15-B继续采用单变量实验，只把Backbone学习率倍率从0.1恢复为1.0，验证是否能够进一步恢复raw backbone，并为后续SGER优化提供更强的基础深度。
+
+
+## 二、实验15-A训练稳定性结论
+
+实验14与实验15-A训练过程如下：
+
+指标                         实验14 Epoch3至9       实验15-A Epoch3至9
+abs_depth_error              约79至82               约4.61至5.07
+geometry_mask_ratio          约0.002至0.012          约0.560至0.562
+
+取消早期冻结后：
+
+（1）abs_depth_error不再接近80；
+（2）geometry_mask_ratio稳定在约0.56；
+（3）raw backbone能够从零正常训练；
+（4）实验14的冻结权重与BatchNorm统计漂移问题不再出现；
+（5）Epoch12至Epoch15没有发生新的灾难性跳变。
+
+因此，实验15-B继续保持：
+
+freeze_backbone_epochs = 0
+
+不再恢复“冻结前8个Epoch”的训练方式。
+
+
+## 三、实验15-A的DTU结果
+
+所有DTU指标均为越低越好。
+
+设置                         Acc.      Comp.     Overall
+实验13 Epoch12 raw           0.2835    0.3468    0.3152
+实验14 Epoch12 raw           0.2889    0.3887    0.3388
+实验14 Epoch15 raw           0.2923    0.3884    0.3404
+实验15-A Epoch12             0.2908    0.3563    0.3236
+实验15-A Epoch15             0.2851    0.3539    0.3195
+
+### 1. 实验15-A相对实验14明显改善
+
+使用Epoch15比较：
+
+Acc.：0.2923下降到0.2851，改善0.0072；
+Comp.：0.3884下降到0.3539，改善0.0345；
+Overall：0.3404下降到0.3195，改善0.0209，约6.1%。
+
+完整度改善最明显，说明取消早期冻结后，多视图深度的一致性和点云有效覆盖得到恢复。
+
+### 2. Epoch15优于Epoch12
+
+实验15-A内部：
+
+Acc.：0.2908下降到0.2851，改善0.0057；
+Comp.：0.3563下降到0.3539，改善0.0024；
+Overall：0.3236下降到0.3195，改善0.0041。
+
+说明实验15-A在Epoch12后仍有有效学习，当前最佳checkpoint是Epoch15。
+
+### 3. 与实验13最佳raw结果仍有小幅差距
+
+实验15-A Epoch15相对实验13 Epoch12 raw：
+
+Acc.：增加0.0016；
+Comp.：增加0.0071；
+Overall：增加0.0043。
+
+差距已经从实验14的0.0236缩小到0.0043。当前主要剩余问题仍是Comp.，但恶化幅度已经很小。
+
+逐场景看，Scan49和Scan118仍然是完整度改进的重点：
+
+Scan49：Acc. 0.4251，Comp. 0.5878；
+Scan118：Acc. 0.2334，Comp. 0.4655。
+
+
+## 四、实验15-A的SGER诊断
+
+实验15-A Epoch15关键指标为：
+
+refined_improved_pixel_ratio = 0.5483
+mean_abs_depth_residual = 0.2152
+residual_sign_accuracy = 0.6111
+gate_precision = 0.4405
+gate_recall = 0.6069
+
+这些指标仍未达到实验15设定的SGER继续条件：
+
+（1）improved pixel ratio为54.8%，低于60%；
+（2）residual sign accuracy为61.1%，低于70%；
+（3）Gate precision只有44.1%，误开放仍然较多；
+（4）Gate recall约60.7%，能够找到部分收益区域，但选择不够准确。
+
+训练后期还出现：
+
+指标                         Epoch9    Epoch12   Epoch15
+mean_abs_depth_residual      0.1677    0.2071    0.2152
+improved_pixel_ratio         0.5871    0.5514    0.5483
+residual_sign_accuracy       0.6311    0.6060    0.6111
+
+残差幅度继续增加，但改善比例下降。这说明Residual Proposal的方向准确率仍是当前SGER的第一问题，Benefit Gate误开放是第二问题。
+
+实验15-B暂不同时修改这两部分。必须先完成Backbone学习率的单变量验证，避免raw backbone变化和SGER损失变化无法归因。
+
+
+## 五、实验15-B核心假设
+
+实验13使用：
+
+backbone_lr_scale = 1.0
+
+实验15-A使用：
+
+backbone_lr_scale = 0.1
+
+实验15-A设置freeze_backbone_epochs=0后，Backbone虽然从Epoch 0开始训练，但整个训练周期始终只有基础学习率的0.1倍。默认学习率还会在Epoch 10、12和14继续衰减，训练后期Backbone更新幅度更小。
+
+实验15-A已经非常接近实验13，因此实验15-B需要验证：把Backbone学习率倍率恢复为1.0，能否消除剩余0.0043的Overall差距，并进一步降低Scan49和Scan118的完整度误差。
+
+实验15-B的单一假设为：
+
+Backbone学习率倍率0.1限制了raw CasMVSNet的最终收敛和跨场景泛化；恢复到1.0后，raw depth的Acc.、Comp.和Overall应进一步降低。
+
+
+## 六、实验15-B唯一改动
+
+保持实验15-A的模型结构、损失函数、随机种子、训练数据、SGER调度和融合协议全部不变，只修改：
+
+backbone_lr_scale：0.1 -> 1.0
+
+继续保持：
+
+freeze_backbone_epochs = 0
+
+本轮不进行以下改动：
+
+（1）不增加区间冻结；
+（2）不修改BatchNorm模式；
+（3）不提高residual_target_loss_weight；
+（4）不修改Benefit Gate损失；
+（5）不缩小最大残差；
+（6）不修改置信度校准；
+（7）不调整点云融合阈值。
+
+
+## 七、实验15-B训练命令
+
+bash train.sh \
+  1 \
+  ./checkpoints/experiment15_b_backbone_lr1 \
+  --ndepths "48,32,8" \
+  --depth_inter_r "4,2,1" \
+  --dlossw "0.5,1.0,2.0" \
+  --batch_size 2 \
+  --eval_freq 3 \
+  --seed 1 \
+  --use_sger_lite \
+  --sger_max_residual_ratio 0.25 \
+  --raw_depth_loss_weight 1.0 \
+  --refined_depth_loss_weight 1.0 \
+  --residual_loss_weight 0.01 \
+  --gate_loss_weight 0.0 \
+  --safe_refine_loss_weight 0.1 \
+  --safe_refine_margin 0.0 \
+  --residual_target_loss_weight 0.05 \
+  --gate_benefit_loss_weight 0.05 \
+  --residual_target_ratio 0.25 \
+  --benefit_margin_ratio 0.05 \
+  --freeze_backbone_epochs 0 \
+  --backbone_lr_scale 1.0 \
+  --sger_warmup_start_epoch 7 \
+  --sger_warmup_end_epoch 10
+
+不要使用--loadckpt，继续从零训练。
+
+
+## 八、固定推理和融合协议
+
+Epoch12和Epoch15均导出：
+
+A：refined depth + raw photometric confidence
+B：refined depth + residual calibrated confidence
+C：raw depth + raw photometric confidence
+
+实验15-B的核心判断使用C组，因为本轮验证的是Backbone学习率对raw depth的影响。A组用于同步判断SGER是否产生独立收益，B组只作为置信度消融。
+
+必须为实验15-B使用全新的输出目录。推理时明确设置：
+
+fusion_depth_source = raw
+fusion_confidence_source = raw
+
+固定以下融合参数：
+
+conf = 0.9
+thres_view = 实验13、14、15-A使用的相同值
+几何重投影阈值 = 实验13、14、15-A使用的相同值
+
+本轮不进行融合阈值搜索。
+
+
+## 九、必须记录的指标
+
+训练和验证阶段至少记录：
+
+stage1/depth_loss
+stage2/depth_loss
+stage3/raw_depth_loss
+stage3/refined_depth_loss
+stage3/raw_abs_error
+stage3/refined_abs_error
+stage3/raw_to_refined_error_delta
+stage3/refined_improved_pixel_ratio
+stage3/refined_worsened_pixel_ratio
+stage3/mean_abs_raw_residual
+stage3/mean_abs_depth_residual
+stage3/residual_sign_accuracy
+stage3/benefit_gate_mean
+stage3/gate_on_improved_mean
+stage3/gate_on_worsened_mean
+stage3/gate_precision
+stage3/gate_recall
+geometry_mask_ratio
+probability_entropy_mean
+depth_variance_mean
+top1_top2_margin_mean
+backbone实际学习率
+SGER实际学习率
+
+DTU融合阶段每个场景记录：
+
+Acc.
+Comp.
+Overall
+point_count
+photometric_mask_ratio
+geometric_mask_ratio
+final_mask_ratio
+view_consistency_count_distribution
+
+
+## 十、实验15-B成功标准
+
+### 1. 训练稳定性
+
+（1）Epoch3、Epoch6和Epoch9的abs_depth_error不得接近80；
+（2）geometry_mask_ratio保持约0.50至0.57；
+（3）日志中的Backbone学习率等于基础学习率；
+（4）SGER启用时raw depth不能发生灾难性跳变。
+
+### 2. 最低改善标准
+
+实验15-A最佳结果为Epoch15：
+
+Acc. = 0.2851
+Comp. = 0.3539
+Overall = 0.3195
+
+实验15-B至少应满足：
+
+Overall < 0.3195
+Comp. < 0.3539
+
+如果只改善Acc.但Comp.恶化，不认为实验15-B成功。
+
+### 3. 目标标准
+
+恢复或超过实验13 Epoch12 raw：
+
+Acc. <= 0.2835
+Comp. <= 0.3468
+Overall <= 0.3152
+
+推荐进一步目标：
+
+Overall <= 0.3120
+Comp. <= 0.3450
+
+
+## 十一、实验结果的分支判断
+
+### 情况A：raw结果达到或超过实验13
+
+如果C组达到Acc. <= 0.2835、Comp. <= 0.3468、Overall <= 0.3152，说明Backbone学习率恢复有效。
+
+下一轮固定backbone_lr_scale=1.0，只修改：
+
+residual_target_loss_weight：0.05 -> 0.10
+
+目标是把residual_sign_accuracy从约0.61提高到0.70以上，使SGER refined输出开始稳定优于raw。
+
+### 情况B：raw结果与实验15-A接近
+
+如果Overall仍在约0.318至0.321，但训练稳定，则说明0.1倍学习率已经足以使raw backbone接近收敛，提高到1.0没有明显额外收益。
+
+下一轮不继续增加Backbone学习率，而是保持表现更好的学习率设置，并单独提高residual_target_loss_weight。
+
+### 情况C：raw结果反而恶化
+
+如果Acc.、Comp.或Overall明显高于实验15-A，说明1.0倍Backbone学习率使SGER联合损失对共享主干的干扰被放大。
+
+下一步不继续调学习率，而应实施显式梯度隔离消融，重点检查：
+
+（1）refined depth loss通过depth_refined = depth_raw + residual更新depth_raw；
+（2）Residual和Gate通过ref_feature向FeatureNet反向传播；
+（3）概率熵、深度方差和top1-top2 margin没有detach；
+（4）NormalHead输入没有完全detach；
+（5）safe-refine loss通过refined输出影响Backbone。
+
+目标训练边界应为：raw depth loss负责更新CasMVSNet backbone，SGER相关损失主要更新NormalHead、Residual Proposal和Benefit Gate。
+
+
+## 十二、最终推荐
+
+更正后的实验15-A已经证明：取消错误的早期冻结能够同时解决训练崩溃并显著降低DTU的Acc.、Comp.和Overall，最佳Overall从实验14的约0.3404下降到0.3195，距离实验13最佳raw结果只差0.0043。
+
+实验15-B继续采用最小单变量方案，仅将backbone_lr_scale从0.1恢复为1.0。该实验用于判断剩余差距是否来自Backbone学习率不足。无论15-B结果如何，后续SGER优化都应优先提升Residual Proposal的方向准确率，再改善Benefit Gate的选择精度，最终使自几何与边缘细化残差-CasMVSNet网络的refined输出在相同融合协议下同时优于raw输出。

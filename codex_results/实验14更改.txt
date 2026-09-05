@@ -1,0 +1,443 @@
+实验14：收益监督的选择性几何细化（BS-SGER）改进方案
+
+一、总体结论
+
+现有 SGER-CasMVSNet 的基础深度主干已经有效，当前真正拖累结果的是 SGER 深度细化器。实验14不应继续增加网络容量、恢复多阶段 SGER 或单纯调整残差上限，而应把 SGER 改造成“受收益监督的 Stage3 选择性残差修正器”。
+
+在实验14证明 refined depth 稳定优于 raw depth 之前，推理和点云融合继续默认使用：
+
+raw depth + raw photometric confidence
+
+
+二、当前网络架构
+
+当前网络的数据流为：
+
+多视图图像
+    ↓
+共享 FeatureNet（FPN）
+    ├─ Stage1：1/4 分辨率，48 个深度假设
+    ├─ Stage2：1/2 分辨率，32 个深度假设
+    └─ Stage3：原分辨率，8 个深度假设
+            ↓
+Homography Warping
+            ↓
+多视图方差代价体
+            ↓
+3D CostRegNet
+            ↓
+Softmax + Depth Regression
+            ↓
+depth_raw + photometric_confidence
+            ↓
+NormalHead
+            ↓
+SGERBlock
+    ├─ 深度、法线、置信度
+    ├─ 图像边缘、深度梯度、曲率
+    ├─ DualRegionGate
+    └─ ResidualDepthHead
+            ↓
+depth_refined = depth_raw + gate × residual
+
+SGER-Lite 只在 Stage3 工作，Stage1 和 Stage2 保持原始 CasMVSNet 路径。该结构能够避免早期阶段的错误 residual 改变后续级联搜索中心，因此 Stage3-only 是应继续保留的结构边界。
+
+
+三、实验结果分析
+
+1. 最好结果来自 raw depth，而不是 refined depth
+
+四个已记录 DTU 场景的主要结果如下，acc、comp 和 overall 均为越低越好：
+
+设置                              acc       comp      overall
+Baseline Epoch15                0.3015    0.3569    0.3292
+实验10，全阶段 SGER             0.3286    0.3800    0.3543
+实验11，Stage3 refined          0.2997    0.3685    0.3341
+实验12，raw                     0.2882    0.3646    0.3264
+实验13，Epoch12 refined         0.3101    0.3686    0.3394
+实验13，Epoch12 raw             0.2835    0.3468    0.3152
+
+实验13 Epoch12 的 raw 结果相对 baseline：
+
+acc：     改善 0.0153
+comp：    改善 0.0091
+overall：改善 0.0122，约 3.7%
+
+但是同一个 checkpoint 使用 refined depth 后，overall 从 0.3152 恶化到 0.3394。由此可以确定：当前 backbone 已经具备较好的深度估计能力，而 SGER refinement 对最终输出是负贡献。
+
+2. warm-up 解决了训练稳定性，但没有解决 refinement 质量
+
+实验12前六个 epoch 的 abs_depth_error 约为 80，说明从零训练时 backbone、NormalHead、Gate 和 ResidualHead 同时竞争会导致严重早期失稳。
+
+实验13加入渐进启用后：
+
+Epoch 0：abs_depth_error = 8.4418
+Epoch 3：abs_depth_error = 6.9992
+Epoch 6：abs_depth_error = 6.4177
+
+因此，SGER warm-up 有效，应在实验14中保留。
+
+但实验13最终的 refined_improved_pixel_ratio 为：
+
+Epoch 12：0.3787
+Epoch 15：0.3700
+
+只有约 37% 的有效像素经过细化后得到改善，其余约 63% 的像素持平或变差。这说明当前 Gate 并没有学会判断“哪些像素值得修正”。
+
+3. 当前 Gate 缺少明确的语义监督
+
+现有 Gate 主要通过 refined depth loss 间接训练，并使用：
+
+gate_loss_weight = 0.001
+L_gate = mean(geometry_gate)
+
+该损失只表达“Gate 尽量小”，没有定义：
+
+（1）哪些像素应该开放；
+（2）当前 residual 是否能改善 raw depth；
+（3）Gate 开放后的实际收益；
+（4）合理的门控占空比。
+
+实验11和实验12中 Gate 最终约为 0.72～0.75，证明 Gate 实际退化成了大面积开放的软缩放器，而不是局部的选择性修正器。
+
+4. Residual 只受到幅度约束，缺少方向监督
+
+当前实现为：
+
+raw_residual = max_residual × tanh(residual_logit)
+depth_refined = depth_raw + gate × raw_residual
+
+现有 residual loss 主要限制 residual 的绝对幅度，safe-refine loss 只在 refined 结果变差后施加惩罚。两者都没有明确告诉 ResidualHead：
+
+GT - depth_raw 应该是正值还是负值。
+
+因此，即使 residual 数值较小，只要方向错误，仍可能系统性地破坏原本较好的 raw depth。
+
+5. 法线和几何线索存在自洽性偏差
+
+SGER 同时使用：
+
+（1）depth_raw；
+（2）从 depth_raw 反算的 normal_depth；
+（3）由 depth_raw、confidence 和 reference feature 预测的 normal_pred；
+（4）由 depth_raw 计算的深度梯度和曲率。
+
+这些信息大部分来自同一个 raw depth。它们可能彼此一致，却同时偏离真实表面。NormalHead 没有独立的法线真值监督，因此 normal_depth_cos 较高只能说明预测法线和当前深度自洽，不能证明深度本身正确。
+
+6. SGER 缺乏真正的多视图不确定性输入
+
+当前 SGER 只使用参考图特征和一个 photometric confidence 标量，没有直接看到：
+
+（1）概率体熵；
+（2）第一峰与第二峰的概率差；
+（3）深度概率方差；
+（4）代价曲线是否多峰；
+（5）不同源视图之间的匹配分歧。
+
+真正需要修正的区域通常正是深度概率分布模糊或多峰的位置。仅依靠最终 photometric confidence 难以可靠判断修正风险。
+
+
+四、候选改进路线
+
+方案A：继续调整 Gate 权重、阈值和 residual 上限
+
+可以提高 gate loss、限制平均 Gate 到 0.10～0.30，或继续缩小 residual 范围。
+
+优点：代码改动小。
+
+缺点：只能控制“修多少”，仍然没有解决“哪里修、往哪修”。实验11～13已经证明，仅依靠缩小 residual 和 warm-up 不能使 refined depth 超过 raw depth。
+
+方案B：收益监督的选择性残差细化
+
+保留 Stage3-only 和 warm-up，明确分离三个任务：
+
+ResidualHead：提出往哪个方向修、修多少；
+BenefitGate：判断当前 residual 是否能带来真实收益；
+Raw backbone：维持原始深度估计能力。
+
+该方案能够直接解决实验中暴露出的 Gate 无语义和 residual 无方向监督问题，是实验14推荐方案。
+
+方案C：在 Stage3 代价体内部联合几何正则
+
+将法线和几何信息加入 3D CostRegNet 或重新构造深度概率体。
+
+优点：理论性能上限较高。
+
+缺点：显存消耗、训练风险和实现复杂度明显增加。当前 raw backbone 已经取得最佳结果，没有证据表明必须重写代价体，因此不适合作为下一轮首选。
+
+
+五、实验14最佳方案：BS-SGER
+
+方案名称：
+
+Benefit-Supervised Selective Geometry Refinement
+收益监督的选择性几何细化
+
+1. 网络结构
+
+实验14继续只在 Stage3 使用 SGER：
+
+Stage3 probability volume
+    ├─ depth_raw
+    ├─ photometric confidence
+    ├─ probability entropy
+    ├─ depth variance
+    └─ top1-top2 probability margin
+             ↓
+Reference feature + geometry cues
+             ↓
+Residual Proposal Head → raw_residual r
+Benefit Gate Head       → benefit_gate g
+             ↓
+depth_refined = depth_raw + beta × g × r
+
+Residual 继续限制在：
+
+r ∈ [−0.25Δ, +0.25Δ]
+
+其中 Δ 为 Stage3 depth interval。
+
+SGERBlock 必须同时输出未门控的 raw_residual 和实际生效的 gated_residual，以便对 ResidualHead 和 BenefitGate 分别监督。
+
+2. 直接监督 residual 方向
+
+构造有界 residual 目标：
+
+r_target = clamp(
+    depth_gt - stop_gradient(depth_raw),
+    -0.25 × depth_interval,
+    +0.25 × depth_interval)
+
+使用：
+
+L_res_target = SmoothL1(raw_residual, r_target)
+
+该损失明确告诉 ResidualHead 正确的修正方向和幅度，不再只要求 residual 尽量小。
+
+3. 使用真实收益监督 BenefitGate
+
+根据未门控 residual 提议构造收益标签：
+
+raw_error = abs(depth_raw - depth_gt)
+proposal_error = abs(depth_raw + stop_gradient(raw_residual) - depth_gt)
+
+benefit_target = 1，若：
+
+proposal_error + tau < raw_error
+
+否则 benefit_target = 0。
+
+推荐初值：
+
+tau = 0.05～0.10 × Stage3 depth interval
+
+BenefitGate 使用带正负样本平衡的 BCE 或 Focal Loss：
+
+L_gate_benefit = FocalBCE(benefit_gate, benefit_target)
+
+这样 Gate 学习的是“当前 residual 提议是否真的能改善 raw depth”，而不是没有明确语义的 Gate 均值。
+
+4. 隔离 backbone 和 refiner 的梯度
+
+SGER 分支的输入深度建议使用：
+
+depth_for_sger = stop_gradient(depth_raw)
+
+训练时：
+
+（1）raw depth loss 只负责更新 CasMVSNet backbone；
+（2）residual target loss 和 benefit gate loss 主要更新 SGER；
+（3）refined loss 初期不反向扰动 backbone；
+（4）最后可用 backbone_lr_scale = 0.1 进行短时间联合微调。
+
+这样可以避免 refined depth loss 通过 depth_raw + residual 对 backbone 形成重复或冲突梯度。
+
+5. 保留 warm-up，并改成分阶段训练
+
+推荐训练调度：
+
+Epoch 0～3：
+beta = 0；
+只训练 raw backbone 和现有几何辅助损失；
+不让随机初始化的 refiner 改变最终深度。
+
+Epoch 4～6：
+冻结或 detach backbone；
+主要训练 ResidualHead 的 L_res_target；
+BenefitGate 保持关闭或低权重。
+
+Epoch 7～10：
+训练 BenefitGate；
+beta 从 0 线性增加到 1；
+开始使用 L_gate_benefit 和 safe-refine loss。
+
+Epoch 11～15：
+beta = 1；
+完整启用 BS-SGER；
+backbone 保持冻结，或者使用 0.1 倍学习率短暂联合微调。
+
+6. 推荐损失函数
+
+L_total =
+    L_raw_depth
+    + 0.05 × L_res_target
+    + 0.05 × L_gate_benefit
+    + 0.10 × L_safe_refine
+    + 0.005 × L_residual_magnitude
+    + L_geometry
+
+建议删除当前简单的：
+
+L_gate = mean(geometry_gate)
+
+或者只保留一个很弱的 Gate 上界预算：
+
+L_gate_budget = relu(mean(benefit_gate) - 0.30)^2
+
+该预算只用于防止 Gate 大面积开放，不能替代 benefit supervision。
+
+7. 增加多视图不确定性线索
+
+DepthNet 应从 Stage3 probability volume 额外计算并输出：
+
+probability_entropy = -sum(p × log(p))
+depth_variance = sum(p × (d - depth_raw)^2)
+top1_top2_margin = top1_probability - top2_probability
+
+这些统计量与 photometric confidence 一起输入 BenefitGate。它们用于判断当前深度概率分布是否尖锐、是否多峰、当前像素是否适合被修正。
+
+
+六、实验14必须增加的诊断指标
+
+训练和验证至少记录：
+
+stage3/raw_abs_error
+stage3/refined_abs_error
+stage3/raw_to_refined_error_delta
+stage3/refined_improved_pixel_ratio
+stage3/refined_worsened_pixel_ratio
+stage3/mean_abs_raw_residual
+stage3/mean_abs_gated_residual
+stage3/benefit_gate_mean
+stage3/gate_on_improved_mean
+stage3/gate_on_worsened_mean
+stage3/gate_precision
+stage3/gate_recall
+stage3/residual_sign_accuracy
+stage3/residual_target_loss
+stage3/probability_entropy_mean
+stage3/depth_variance_mean
+stage3/top1_top2_margin_mean
+
+点云融合阶段按场景记录：
+
+photometric_mask_ratio
+geometric_mask_ratio
+final_mask_ratio
+view_consistency_count_distribution
+point_count
+
+
+七、实验14成功标准
+
+代码和训练层面的继续条件：
+
+（1）Epoch 0～3 不出现 abs_depth_error 接近 80 的早期崩溃；
+（2）refined_improved_pixel_ratio > 0.60；
+（3）gate_on_improved_mean 至少比 gate_on_worsened_mean 高 0.20；
+（4）residual_sign_accuracy > 0.70；
+（5）beta 增加时 raw depth 指标不发生灾难性跳变。
+
+最终结果的必要条件：
+
+refined depth + raw confidence 的 DTU overall
+必须低于
+raw depth + raw confidence 的 DTU overall。
+
+只有满足该条件，才能将 refined depth 改为默认推理输出。
+
+
+八、最小消融实验顺序
+
+实验14-A：复现实验13
+
+结构：Stage3-only + warm-up。
+目的：固定随机种子和基准结果。
+
+实验14-B：A + residual target supervision
+
+目的：验证 residual 的修正方向是否正确。
+进入下一组条件：residual_sign_accuracy 明显提升，refined error 不再显著劣于 raw error。
+
+实验14-C：B + benefit gate supervision
+
+目的：验证 Gate 是否只在有真实收益的位置开放。
+进入下一组条件：gate_on_improved_mean 明显高于 gate_on_worsened_mean。
+
+实验14-D：C + probability entropy、variance 和 top1-top2 margin
+
+目的：验证多视图不确定性是否提高 Gate 判断能力。
+进入下一组条件：refined_improved_pixel_ratio > 0.60。
+
+实验14-E：D + backbone 0.1 倍学习率联合微调
+
+目的：在不破坏 raw backbone 的前提下获得最终性能。
+
+每个 checkpoint 必须导出三组结果：
+
+A：raw depth + raw confidence
+B：refined depth + raw confidence
+C：refined depth + calibrated confidence
+
+每组记录 acc、comp、overall、每个场景点数、photometric mask 通过率和 geometric mask 通过率。
+
+关键组 B、C、D 至少使用三个随机种子复验。当前文档只记录了四个 DTU 场景，实验14最终结论还应在完整 DTU evaluation set 上验证。
+
+
+九、最终推荐
+
+实验14保留以下已经被实验验证有效的设计：
+
+（1）Stage3-only SGER-Lite；
+（2）Stage1、Stage2 保持 raw cascade；
+（3）SGER residual warm-up；
+（4）最大 residual 范围为 0.25 × depth interval；
+（5）raw depth + raw confidence 作为默认输出和对照组。
+
+实验14新增的核心内容为：
+
+（1）使用 residual target 解决“往哪个方向修”；
+（2）使用 benefit target 解决“哪些位置应该修”；
+（3）使用 probability volume 统计量解决“当前修正是否可信”；
+（4）通过 detach 和分阶段训练保护已经有效的 raw backbone。
+
+在现有实验结果下，该方案比继续增加平滑损失、增大 SGER 容量、恢复多阶段 refinement 或继续调整置信度公式更符合当前网络的主要矛盾。
+
+
+十、改动
+主要改动：
+
+  - models/cas_mvsnet.py:11
+      - 从概率体提取归一化熵、深度方差和 top1–top2 峰值差。
+      - 将多视图不确定性输入 SGER。
+      - Stage3 raw depth 在进入 SGER 时 detach，保护 CasMVSNet 主干。
+
+  - models/sger_refinement.py:147
+      - 分离未门控 raw_depth_residual 和 benefit_gate。
+      - 实际细化为：
+        depth_refined = depth_raw + benefit_gate × raw_depth_residual
+
+      - 保留自几何、边缘、曲率和双区域先验。
+
+  - models/module.py:852
+      - 新增有界残差方向目标。
+      - 新增基于真实误差改善的收益标签。
+      - 新增平衡 Gate BCE。
+      - 增加 raw/refined 误差、改善/恶化比例、Gate区分度、残差符号准确率等指标。
+
+  - train.py:89
+      - 新增实验14参数。
+      - Epoch 0–3：保护 raw backbone。
+      - Epoch 4起：训练 residual proposal。
+      - Epoch 7–10：渐进启用 benefit gate 和实际细化。
+      - 旧的无语义 Gate 均值惩罚默认关闭。

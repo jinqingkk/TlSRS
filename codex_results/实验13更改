@@ -1,0 +1,214 @@
+ ## 实验13推荐：SGER渐进启用，解决从零训练早期失稳
+
+  实验13建议只解决实验12最优先的问题：Epoch 0–6深度误差约80、SGER与主干从零联合训练不稳定。
+
+  暂时不同时修改gate结构、residual target或confidence calibration，保证实验结果可以归因。
+
+  ### 1. 保持实验12不变的部分
+
+  Stage3-only SGER-Lite
+  从零训练
+  freeze_backbone_epochs=0
+  backbone_lr_scale=1.0
+  sger_max_residual_ratio=0.25
+  raw_depth_loss_weight=1.0
+  residual_loss_weight=0.01
+  gate_loss_weight=0.001
+  safe_refine_loss_weight=0.1
+  safe_refine_margin=0
+
+  Stage1、Stage2继续保持原始CasMVSNet，不运行NormalHead和SGERBlock。
+
+  ### 2. 唯一核心改动：SGER渐进启用
+
+  增加训练进度系数：
+
+  depth_refined =
+      depth_raw + β(epoch) × geometry_gate × raw_residual
+
+  推荐调度：
+
+  Epoch 0–2: β = 0
+  Epoch 3:   β = 0.25
+  Epoch 4:   β = 0.50
+  Epoch 5:   β = 0.75
+  Epoch ≥6:  β = 1.00
+
+  含义：
+
+  - Epoch 0–2先让CasMVSNet raw主干建立有效深度；
+  - NormalHead和SGER仍正常前向，但SGER残差暂不影响最终深度；
+  - Epoch 3–5逐渐开放SGER；
+  - Epoch 6后进入完整Stage3 refinement。
+
+  这不是冻结主干，所有实验仍符合“从零训练”。
+
+  ### 3. refined loss同步渐进启用
+
+  建议refined depth loss也使用同一个调度：
+
+  Epoch 0–2:
+  raw_depth_loss_weight = 1.0
+  refined_depth_loss_weight = 0
+
+  Epoch 3–5:
+  refined_depth_loss_weight = 0.25 / 0.50 / 0.75
+
+  Epoch ≥6:
+  refined_depth_loss_weight = 1.0
+
+  也可以把最终值固定为0.5，但为了与实验12只比较训练调度，实验13推荐最终仍恢复到1.0。
+
+  gate、residual和safe-refine损失同样建议乘以β(epoch)：
+
+  L_sger =
+      β × (
+          L_refined
+          + 0.01 L_residual
+          + 0.001 L_gate
+          + 0.1 L_safe
+      )
+
+  Epoch 0–2只训练raw depth和原有几何监督，避免随机SGER目标干扰主干。
+
+  ## 4. 需要新增的训练参数
+
+  建议实现：
+
+  --sger_warmup_start_epoch 3
+  --sger_warmup_end_epoch 6
+
+  训练日志新增：
+
+  sger_residual_scale
+  effective_refined_depth_loss_weight
+  effective_gate_loss_weight
+  effective_safe_refine_loss_weight
+
+  ## 5. 实验13训练命令
+
+  实现调度参数后：
+
+  bash train.sh \
+    1 \
+    ./checkpoints/experiment13_sger_warmup \
+    --ndepths "48,32,8" \
+    --depth_inter_r "4,2,1" \
+    --dlossw "0.5,1.0,2.0" \
+    --batch_size 2 \
+    --eval_freq 3 \
+    --use_sger_lite \
+    --sger_max_residual_ratio 0.25 \
+    --raw_depth_loss_weight 1.0 \
+    --refined_depth_loss_weight 1.0 \
+    --residual_loss_weight 0.01 \
+    --gate_loss_weight 0.001 \
+    --safe_refine_loss_weight 0.1 \
+    --safe_refine_margin 0.0 \
+    --freeze_backbone_epochs 0 \
+    --backbone_lr_scale 1.0 \
+    --sger_warmup_start_epoch 3 \
+    --sger_warmup_end_epoch 6
+
+  不要使用--loadckpt。
+
+  ## 6. 必须记录的指标
+
+  除现有指标外，增加：
+
+  stage3/raw_depth_loss
+  stage3/refined_depth_loss
+  stage3/raw_to_refined_error_delta
+  stage3/refined_improved_pixel_ratio
+  stage3/mean_abs_depth_residual
+  stage3/geometry_gate_mean
+  sger_residual_scale
+
+  重点观察：
+
+  - Epoch 0–6是否还会出现abs_depth_error≈80；
+  - β增加时depth loss是否出现突跳；
+  - refined是否开始优于raw；
+  - gate是否仍在Epoch 9后升到约0.75。
+
+  ## 7. 固定评估协议
+
+  每个Epoch 12和15 checkpoint都导出三组：
+
+  A: raw depth + raw confidence
+  B: refined depth + raw confidence
+  C: refined depth + calibrated confidence
+
+  实验12缺少B组，实验13必须补齐，否则无法区分refined depth和calibration的独立作用。
+
+  ## 8. 实验13成功标准
+
+  训练稳定性：
+
+  Epoch 0–3 abs_depth_error不再接近80
+  depth loss从训练早期正常下降
+
+  refinement有效性：
+
+  raw_to_refined_error_delta > 0
+  refined_improved_pixel_ratio > 0.5
+
+  DTU结果：
+
+  refined + raw overall < raw + raw overall
+
+  最低要求：
+
+  实验13 raw + raw overall ≤ 实验12-c的0.3264
+
+  目标要求：
+
+  实验13最佳overall < 实验11-c的0.3232
+
+  如果实验13解决了早期失稳，但gate仍回升至0.7以上，那么实验14再单独引入目标占空比gate约束；不要在实验13同时加入，以免无法判断改善来自训练调度还是gate设计。
+
+  实验11、实验12、实验13中，Stage1 和 Stage2 的前向网络结构没有加入 SGER，也没有直接进行深度残差细化，仍走原 CasMVSNet 的 raw depth 路径。
+
+  具体流程是：
+
+  Stage1 原始 CasMVSNet 深度
+    ↓ raw depth 作为 Stage2 搜索中心
+  Stage2 原始 CasMVSNet 深度
+    ↓ raw depth 作为 Stage3 搜索中心
+  Stage3 原始深度
+    ↓ NormalHead + SGER-Lite
+  Stage3 refined depth
+
+  各实验区别如下：
+
+   实验      Stage1            Stage2            Stage3
+  ━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   实验11    原始 CasMVSNet    原始 CasMVSNet    SGER-Lite，残差上限 0.5
+  ────────  ────────────────  ────────────────  ────────────────────────────────────────────────────────
+   实验12    原始 CasMVSNet    原始 CasMVSNet    SGER-Lite，残差上限 0.25，增加 gate/safe-refine 等约束
+  ────────  ────────────────  ────────────────  ────────────────────────────────────────────────────────
+   实验13    与实验12相同      与实验12相同      在实验12基础上增加 Epoch 0–6 渐进启用
+
+  在 --use_sger_lite 下：
+
+  - Stage1、Stage2 不运行 NormalHead
+  - Stage1、Stage2 不运行 SGERBlock
+  - 不产生 depth_raw/depth_refined/depth_residual/geometry_gate 等 SGER 输出
+  - Stage1→Stage2、Stage2→Stage3 使用的都是该阶段原始深度
+  - 实验13的 residual/loss warm-up 仅对存在 SGER 输出的 Stage3 生效
+
+  但要注意，“结构没改”不等于“训练后参数完全等同原始模型”：
+
+  - Stage1、Stage2仍参与原有多阶段深度损失
+  - 共享的 FeatureNet 等主干参数会被整个训练目标共同更新
+  - 当前几何平滑、曲率、边缘感知等已有损失也可能作用于 Stage1、Stage2
+  - 因此训练后的 Stage1/Stage2数值可能变化，但不是因为给它们加入了 SGER 模块
+  - 实验13命令使用 --freeze_backbone_epochs 0 --backbone_lr_scale 1.0，所以Stage1/Stage2及共享主干从Epoch 0正常训练，没有冻结
+
+  只有使用 --use_sger 而不是 --use_sger_lite 时，才会成为全阶段 SGER：
+
+  Stage1 SGER refined → Stage2搜索中心
+  Stage2 SGER refined → Stage3搜索中心
+  Stage3 SGER refined → 最终输出
+
+  你当前实验13命令使用的是 --use_sger_lite，所以确定是 Stage3-only，不是全阶段修改。
