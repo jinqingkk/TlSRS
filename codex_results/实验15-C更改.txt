@@ -1,0 +1,434 @@
+0# 实验15-C：SGER梯度隔离与门控塌缩诊断
+
+## 一、实验15-B结论
+
+实验15-B将Backbone学习率倍率从0.1提高到1.0，没有超过实验15-A，反而使Epoch15的DTU重建质量明显下降。因此，“实验15-A剩余差距主要由Backbone学习率不足造成”的假设被否定。
+
+实验15-C不再提高Backbone学习率，也不立即提高Residual Target损失权重。下一步首先定位两个问题：
+
+（1）Epoch9至Epoch12的SGER有效残差为什么接近零；
+（2）SGER相关损失是否通过共享特征和refined depth路径干扰CasMVSNet raw backbone。
+
+实验15-C继续以自几何与边缘细化残差-CasMVSNet网络（SGER-CasMVSNet）为研究主体。raw depth作为受保护的主干和对照组，最终目标仍然是使SGER refined输出在相同评估协议下同时降低Acc.、Comp.和Overall。
+
+
+## 二、实验15-B评估口径更正
+
+实验15-B测试命令包含：
+
+--fusion_depth_source raw
+--fusion_confidence_source raw
+
+因此实验15-B的实际评估口径是：
+
+raw depth + raw photometric confidence
+
+不是“raw depth + residual confidence”。实验15-C后续结果必须继续明确标记A、B、C三组，避免深度源和置信度源混淆。
+
+
+## 三、实验15-B结果分析
+
+所有DTU指标均为越低越好：
+
+设置                         Acc.      Comp.     Overall
+实验13 Epoch12 raw           0.2835    0.3468    0.3152
+实验15-A Epoch12             0.2908    0.3563    0.3236
+实验15-A Epoch15             0.2851    0.3539    0.3195
+实验15-B Epoch12 raw         0.2915    0.3596    0.3256
+实验15-B Epoch15 raw         0.3025    0.3604    0.3315
+
+### 1. 实验15-B相对实验15-A退化
+
+Epoch12：
+
+Acc.增加0.0007；
+Comp.增加0.0033；
+Overall增加0.0020。
+
+Epoch15：
+
+Acc.增加0.0174；
+Comp.增加0.0065；
+Overall增加0.0120。
+
+因此，backbone_lr_scale=1.0不是当前联合训练的正确方向。实验15-C恢复实验15-A的：
+
+backbone_lr_scale = 0.1
+freeze_backbone_epochs = 0
+
+### 2. 实验15-B后期明显退化
+
+实验15-B从Epoch12到Epoch15：
+
+Acc.：0.2915上升到0.3025；
+Comp.：0.3596上升到0.3604；
+Overall：0.3256上升到0.3315。
+
+主要退化来自Acc.，说明后期产生了更多偏离真实表面的错误点，而不是仅仅缺少点云覆盖。
+
+同期训练指标只发生小幅变化：
+
+abs_depth_error：4.5397上升到4.6079；
+depth_loss：4.2356上升到4.2858。
+
+训练期像素深度指标与最终DTU点云质量出现明显不一致，说明必须增加raw/refined分离指标、SGER梯度指标和点云融合通过率，不能只根据总depth loss选择checkpoint。
+
+
+## 四、实验15-B暴露的SGER异常
+
+### 1. Epoch9至Epoch12有效残差异常接近零
+
+实验15-B记录：
+
+Epoch9 mean_abs_depth_residual  = 1.18e-14
+Epoch12 mean_abs_depth_residual = 6.97e-15
+Epoch15 mean_abs_depth_residual = 0.0873
+
+按照当前warm-up：
+
+Epoch7：SGER residual scale beta = 0.25
+Epoch8：beta = 0.50
+Epoch9：beta = 0.75
+Epoch10及以后：beta = 1.00
+
+因此Epoch9和Epoch12的有效残差接近零，不是warm-up主动关闭SGER。可能原因有三种：
+
+（1）raw residual proposal接近零；
+（2）Benefit Gate接近零；
+（3）raw residual和Benefit Gate同时缩小。
+
+现有结果缺少mean_abs_raw_residual和benefit_gate_mean，暂时不能确定是哪一个分支塌缩。
+
+### 2. Gate在Epoch9至Epoch12可能完全关闭
+
+实验15-B记录：
+
+Epoch9 gate_precision = 0，gate_recall = 0；
+Epoch12 gate_precision = 0，gate_recall = 0；
+Epoch15 gate_precision = 0.4181，gate_recall = 0.6118。
+
+precision和recall同时为零，说明以0.5为阈值时Gate没有预测任何正样本，或者Benefit Target本身没有正样本。必须增加benefit_target_positive_ratio和benefit_gate_mean后才能区分。
+
+### 3. Epoch15 SGER重新开启但raw DTU结果变差
+
+Epoch15有效残差恢复到0.0873，refined_improved_pixel_ratio为0.5820，但raw DTU Overall反而从Epoch12的0.3256恶化到0.3315。
+
+推理虽然使用raw depth，但训练期间SGER相关损失仍可能更新共享Backbone。较大的Backbone学习率会放大这种影响，这与实验15-B的退化模式一致，但必须通过梯度审计确认。
+
+### 4. NormalHead训练也存在不稳定信号
+
+normal_depth_cos：
+
+Epoch9  = 0.4196
+Epoch12 = 0.9897
+Epoch15 = 0.6212
+
+Epoch12接近完全一致，Epoch15又明显下降，说明NormalHead或其输入特征存在较大波动。高normal_depth_cos只表示预测法线与当前深度自洽，不等于深度更接近真实表面。
+
+
+## 五、当前SGER梯度路径问题
+
+虽然SGERBlock接收的是depth_raw.detach()，当前最终深度仍然是：
+
+depth_refined = depth_raw + effective_residual
+
+因此refined depth loss仍可直接通过加法路径更新depth_raw和CasMVSNet backbone。
+
+SGER还使用以下未完全隔离的输入：
+
+（1）Stage3 reference feature；
+（2）photometric confidence；
+（3）probability entropy；
+（4）depth variance；
+（5）top1-top2 probability margin；
+（6）NormalHead使用的reference feature、depth和confidence。
+
+Residual Target、Benefit Gate、safe-refine和refined depth loss可能通过这些路径向FeatureNet、CostRegNet或raw depth分支传播梯度。
+
+实验15-C的核心假设为：
+
+SGER相关损失没有与raw backbone完全隔离；当Backbone学习率从0.1提高到1.0时，冲突梯度被放大，导致raw depth的DTU泛化质量下降。
+
+
+## 六、实验15-C第一阶段：单Batch梯度审计
+
+在开始新的完整训练前，先用一个训练Batch分别对各项损失单独执行backward，记录Backbone和SGER的梯度范数。
+
+需要独立审计：
+
+（1）raw depth loss；
+（2）refined depth loss；
+（3）residual target loss；
+（4）gate benefit loss；
+（5）safe-refine loss；
+（6）normal、curvature和edge smooth等几何辅助损失。
+
+每项损失分别记录：
+
+backbone_grad_norm
+feature_net_grad_norm
+cost_reg_net_grad_norm
+normal_head_grad_norm
+residual_head_grad_norm
+benefit_gate_grad_norm
+
+### 预期梯度边界
+
+损失                         Backbone梯度       SGER梯度
+raw depth loss               有                 无或极小
+refined depth loss           无                 有
+residual target loss         无                 有
+gate benefit loss            无                 有
+safe-refine loss             无                 有
+
+NormalHead和SGER专属几何损失也不应通过输入特征更新raw backbone。原CasMVSNet各Stage的深度监督和明确保留的raw几何辅助损失可以继续更新Backbone。
+
+### 梯度泄漏判定
+
+如果任一SGER专属损失满足：
+
+backbone_grad_norm > 1e-8
+
+则说明存在可测量的梯度泄漏。除绝对值外，还应记录：
+
+backbone_grad_norm / sger_grad_norm
+
+用于判断泄漏相对强度。
+
+
+## 七、实验15-C第二阶段：补齐塌缩诊断指标
+
+Epoch0至Epoch15每个Epoch都记录，Epoch7至Epoch15重点观察：
+
+sger_residual_scale
+effective_residual_target_loss_weight
+effective_gate_benefit_loss_weight
+stage3/raw_abs_error
+stage3/refined_abs_error
+stage3/raw_to_refined_error_delta
+stage3/mean_abs_raw_residual
+stage3/mean_abs_depth_residual
+stage3/residual_sign_accuracy
+stage3/benefit_gate_mean
+stage3/benefit_target_positive_ratio
+stage3/gate_on_improved_mean
+stage3/gate_on_worsened_mean
+stage3/gate_precision
+stage3/gate_recall
+stage3/refined_improved_pixel_ratio
+stage3/refined_worsened_pixel_ratio
+stage3/residual_target_loss
+stage3/gate_benefit_loss
+
+### 塌缩判断规则
+
+情况A：mean_abs_raw_residual正常，但benefit_gate_mean接近零
+
+结论：Benefit Gate塌缩。
+
+情况B：mean_abs_raw_residual接近零，但benefit_gate_mean正常
+
+结论：Residual Proposal塌缩。
+
+情况C：两者都接近零
+
+结论：SGER整体优化失衡，需要检查损失调度和梯度量级。
+
+情况D：两者都正常，但mean_abs_depth_residual接近零
+
+结论：检查effective residual计算、beta赋值、checkpoint恢复和日志采集是否正确。
+
+
+## 八、实验15-C第三阶段：显式梯度隔离
+
+只有第一阶段确认SGER专属损失会更新Backbone后，才实施以下单一核心修改：建立SGER与raw backbone的显式梯度边界。
+
+### 1. 隔离SGER输入
+
+Stage3进入SGER的以下输入全部使用detach后的张量：
+
+depth_raw
+reference feature
+photometric confidence
+probability entropy
+depth variance
+top1-top2 margin
+
+NormalHead接收的Backbone特征、raw depth和confidence也使用detach后的输入。NormalHead自身参数仍正常训练。
+
+### 2. 隔离refined输出的基础深度梯度
+
+训练时使用数值相同但梯度隔离的表达：
+
+depth_refined_for_loss = depth_raw.detach() + effective_residual
+
+这样refined depth loss、safe-refine loss只更新NormalHead和SGER，不通过基础深度项更新Backbone。
+
+推理输出在数值上仍然保持：
+
+depth_refined = depth_raw + effective_residual
+
+detach只改变训练梯度，不改变前向数值和最终网络定义。
+
+### 3. 保留raw backbone监督
+
+raw depth loss继续更新CasMVSNet Backbone：
+
+L_raw = multi-stage raw depth supervision
+
+Stage1、Stage2和Stage3 raw depth均保留原有监督。SGER不能替代raw主干训练，也不能改变Stage1、Stage2的级联搜索中心。
+
+### 4. 固定其他变量
+
+实验15-C完整训练使用：
+
+freeze_backbone_epochs = 0
+backbone_lr_scale = 0.1
+sger_max_residual_ratio = 0.25
+raw_depth_loss_weight = 1.0
+refined_depth_loss_weight = 1.0
+residual_target_loss_weight = 0.05
+gate_benefit_loss_weight = 0.05
+safe_refine_loss_weight = 0.1
+sger_warmup_start_epoch = 7
+sger_warmup_end_epoch = 10
+
+本轮不提高Residual Target权重、不加入Gate预算、不缩小残差范围、不修改融合阈值。
+
+
+## 九、实验15-C训练命令
+
+完成梯度隔离代码并通过梯度审计后：
+
+bash train.sh \
+  1 \
+  ./checkpoints/experiment15_c_gradient_isolation \
+  --ndepths "48,32,8" \
+  --depth_inter_r "4,2,1" \
+  --dlossw "0.5,1.0,2.0" \
+  --batch_size 2 \
+  --eval_freq 3 \
+  --seed 1 \
+  --use_sger_lite \
+  --sger_max_residual_ratio 0.25 \
+  --raw_depth_loss_weight 1.0 \
+  --refined_depth_loss_weight 1.0 \
+  --residual_loss_weight 0.01 \
+  --gate_loss_weight 0.0 \
+  --safe_refine_loss_weight 0.1 \
+  --safe_refine_margin 0.0 \
+  --residual_target_loss_weight 0.05 \
+  --gate_benefit_loss_weight 0.05 \
+  --residual_target_ratio 0.25 \
+  --benefit_margin_ratio 0.05 \
+  --freeze_backbone_epochs 0 \
+  --backbone_lr_scale 0.1 \
+  --sger_warmup_start_epoch 7 \
+  --sger_warmup_end_epoch 10
+
+不要使用--loadckpt，保持从零训练。
+
+
+## 十、固定评估协议
+
+Epoch12和Epoch15分别导出：
+
+A：refined depth + raw confidence
+B：refined depth + residual calibrated confidence
+C：raw depth + raw confidence
+
+主要比较A与C，以判断SGER的独立贡献。B只作为置信度消融，不作为默认结果。
+
+必须使用独立输出目录，并固定：
+
+conf = 0.9
+thres_view = 实验13至15-B的相同值
+几何重投影阈值 = 实验13至15-B的相同值
+
+在refined稳定优于raw之前，不进行融合阈值搜索。
+
+每个场景记录：
+
+Acc.
+Comp.
+Overall
+point_count
+photometric_mask_ratio
+geometric_mask_ratio
+final_mask_ratio
+view_consistency_count_distribution
+
+
+## 十一、实验15-C成功标准
+
+### 1. 梯度隔离标准
+
+raw depth loss能够产生Backbone梯度；
+refined、residual target、gate benefit和safe-refine损失的Backbone梯度为零或不高于1e-8；
+SGER专属损失仍能正常产生NormalHead、Residual Head和Benefit Gate梯度。
+
+### 2. raw backbone保护标准
+
+至少保持实验15-A Epoch15水平：
+
+raw Acc. <= 0.2851
+raw Comp. <= 0.3539
+raw Overall <= 0.3195
+
+目标恢复实验13最佳raw水平：
+
+raw Acc. <= 0.2835
+raw Comp. <= 0.3468
+raw Overall <= 0.3152
+
+### 3. SGER训练标准
+
+residual_sign_accuracy >= 0.70
+refined_improved_pixel_ratio >= 0.60
+refined_worsened_pixel_ratio <= 0.35
+gate_precision >= 0.60
+gate_on_improved_mean - gate_on_worsened_mean >= 0.20
+
+Epoch9至Epoch15不能再次出现没有解释的有效残差归零或突然恢复。
+
+### 4. 最终DTU标准
+
+同一checkpoint、相同raw confidence和相同融合协议下：
+
+refined Acc. < raw Acc.
+refined Comp. < raw Comp.
+refined Overall < raw Overall
+
+只有三项同时满足，才能认为SGER产生独立且稳定的正贡献。
+
+
+## 十二、实验结果分支
+
+### 情况A：梯度隔离后raw和refined均改善
+
+结论：SGER梯度干扰是实验15-B退化的主要原因。保留梯度隔离，下一轮再单独提高residual_target_loss_weight以继续提升方向准确率。
+
+### 情况B：raw得到保护，但refined仍不优于raw
+
+结论：梯度隔离有效，但Residual Proposal或Benefit Gate自身仍不足。根据诊断指标选择唯一改动：
+
+residual_sign_accuracy低于0.70时，只提高residual_target_loss_weight；
+
+sign accuracy达标但Gate区分不足时，只优化Benefit Gate或加入弱Gate预算；
+
+两者达标但refined仍差时，只把最大残差范围从0.25缩小到0.10。
+
+### 情况C：梯度审计没有发现泄漏
+
+不实施梯度隔离训练。根据mean_abs_raw_residual和benefit_gate_mean直接定位塌缩分支，避免进行没有证据支持的结构修改。
+
+### 情况D：梯度隔离后raw仍低于实验15-A
+
+检查raw几何辅助损失、训练随机性、checkpoint与输出目录、推理深度源和融合协议。确认数据流前不继续叠加新的SGER修改。
+
+
+## 十三、最终推荐
+
+实验15-B证明，把Backbone学习率倍率提高到1.0会使raw DTU Overall从实验15-A的0.3195恶化到0.3315。实验15-C应恢复0.1倍Backbone学习率，并首先完成SGER梯度审计和Gate/Residual塌缩定位。
+
+只有证据确认SGER专属损失正在更新共享Backbone后，才实施显式梯度隔离。该方案直接改善SGER与CasMVSNet主干之间的优化边界，使raw depth保持稳定，同时让Residual Proposal和Benefit Gate专注学习局部、正确且有真实收益的自几何与边缘残差修正。
