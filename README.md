@@ -1,3 +1,7 @@
+# SGER-CasMVSNet 项目规则
+
+本项目研究主体为 **自几何与边缘细化残差-CasMVSNet网络（SGER-CasMVSNet）**。网络、损失、训练及评估改进须遵循 [SGER-CasMVSNet 项目整体规则](project_rules/SGER_RULES.md)。该文档维护项目长期原则，具体实验配置与目标单独记录。
+
 # Trianing and testing on DTU datset.
 ## Training
 * Dowload [DTU dataset](https://roboimagedata.compute.dtu.dk/). For convenience, can download the preprocessed [DTU training data](https://drive.google.com/file/d/1eDjh-_bxKKnEuz5h-HXS7EDJn59clx6V/view)

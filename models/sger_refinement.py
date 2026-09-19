@@ -101,7 +101,8 @@ class DualRegionGate(nn.Module):
             nn.Conv2d(hidden_channels, 1, 3, padding=1),
         )
 
-    def forward(self, fused_features, ref_img, depth, confidence, valid_mask):
+    def forward(self, fused_features, ref_img, depth, confidence, valid_mask,
+                return_logits=False):
         region_a, weight_b, _ = build_dual_region_geometry(
             ref_img,
             valid_mask,
@@ -116,15 +117,21 @@ class DualRegionGate(nn.Module):
             self.smooth_k,
         )
         region_b = valid_mask & (~region_a)
-        learned_a = torch.sigmoid(self.gate_a(fused_features)).squeeze(1)
-        learned_b = torch.sigmoid(self.gate_b(fused_features)).squeeze(1)
+        logits_a = self.gate_a(fused_features).squeeze(1)
+        logits_b = self.gate_b(fused_features).squeeze(1)
+        learned_a = torch.sigmoid(logits_a)
+        learned_b = torch.sigmoid(logits_b)
         gate = region_a.float() * learned_a + weight_b * learned_b
         gate = gate * valid_mask.float()
-        return gate.clamp(0.0, 1.0), region_a, region_b, weight_b
+        result = (gate.clamp(0.0, 1.0), region_a, region_b, weight_b)
+        if return_logits:
+            return result + (logits_a, logits_b, valid_mask)
+        return result
 
 
 class ResidualDepthHead(nn.Module):
-    def __init__(self, in_channels, hidden_channels=32):
+    def __init__(self, in_channels, hidden_channels=32, final_activation="relu",
+                 negative_slope=0.01):
         super(ResidualDepthHead, self).__init__()
         reduced_channels = max(hidden_channels // 2, 1)
         self.body = nn.Sequential(
@@ -137,8 +144,18 @@ class ResidualDepthHead(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.output = nn.Conv2d(reduced_channels, 1, 3, padding=1)
+        self.set_final_activation(final_activation, negative_slope)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+
+    def set_final_activation(self, activation, negative_slope=0.01):
+        if activation not in ("relu", "leaky_relu"):
+            raise ValueError("residual final activation must be relu or leaky_relu")
+        if not 0.0 < float(negative_slope) < 1.0:
+            raise ValueError("residual negative slope must be finite and in (0, 1)")
+        self.body[5] = (nn.ReLU(inplace=True) if activation == "relu" else
+                        nn.LeakyReLU(float(negative_slope), inplace=True))
+        self.body[5].train(self.training)
 
     def forward(self, features):
         return self.output(self.body(features)).squeeze(1)
@@ -147,7 +164,8 @@ class ResidualDepthHead(nn.Module):
 class SGERBlock(nn.Module):
     def __init__(self, feature_channels, projected_feature_channels=8,
                  hidden_channels=32, gate_channels=16,
-                 max_residual_ratio=2.0, **gate_kwargs):
+                 max_residual_ratio=2.0, residual_final_activation="relu",
+                 residual_negative_slope=0.01, **gate_kwargs):
         super(SGERBlock, self).__init__()
         self.max_residual_ratio = float(max_residual_ratio)
         self.cues = GeometryCueExtractor()
@@ -159,7 +177,9 @@ class SGERBlock(nn.Module):
         self.gate = DualRegionGate(
             fused_channels, hidden_channels=gate_channels, **gate_kwargs)
         self.residual = ResidualDepthHead(
-            fused_channels, hidden_channels=hidden_channels)
+            fused_channels, hidden_channels=hidden_channels,
+            final_activation=residual_final_activation,
+            negative_slope=residual_negative_slope)
 
     def forward(self, depth, normal_pred, confidence, ref_img,
                 intrinsics, ref_feature, depth_interval, valid_mask=None,
@@ -199,8 +219,10 @@ class SGERBlock(nn.Module):
         fused = torch.cat([
             cues["cue_tensor"], feature, uncertainty], dim=1)
 
-        benefit_gate, region_a, region_b, weight_b = self.gate(
-            fused, ref_img, depth, confidence, cues["valid_mask"])
+        (benefit_gate, region_a, region_b, weight_b,
+         logits_a, logits_b, gate_valid) = self.gate(
+            fused, ref_img, depth, confidence, cues["valid_mask"],
+            return_logits=True)
         residual_logit = self.residual(fused)
         interval = float(depth_interval)
         max_residual = self.max_residual_ratio * interval
@@ -215,6 +237,9 @@ class SGERBlock(nn.Module):
             "depth_residual": gated_residual,
             "residual_ratio": residual_ratio,
             "benefit_gate": benefit_gate,
+            "gate_logits_a": logits_a,
+            "gate_logits_b": logits_b,
+            "gate_valid_mask": gate_valid,
             "geometry_gate": benefit_gate,
             "region_a": region_a,
             "region_b": region_b,

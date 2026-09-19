@@ -1,6 +1,7 @@
  ./train.sh 1 ./checkpoints/cas_dtu     --ndepths "48,32,8"     --depth_inter_r "4,2,1"     --dlossw "0.5,1.0,2.0"     --batch_size 2     --eval_freq 3
 
 
+conda activate mvsnetpy37
 
 # test-cmd
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jinqing002/miniconda3/envs/mvsnetpy37/lib/python3.7/site-packages/torch/lib:$LD_LIBRARY_PATH
@@ -12,5 +13,141 @@ python test.py \
   --loadckpt=./checkpoints/cas_dtu/model_000015.ckpt \
   --outdir=./outputs \
   --interval_scale=1.06 \
-  --filter_method=gipuma
+  --filter_method=gipuma \
+  --use_sger_lite \
+  --fusion_depth_source refined \
+  --fusion_confidence_source residual_calibrated
 
+
+python test.py \
+  --dataset=general_eval \
+  --batch_size=1 \
+  --testpath=data/DTU/dtu_test_all \
+  --testlist=lists/dtu/test.txt \
+  --loadckpt=./checkpoints/cas_dtu/model_000012.ckpt \
+  --outdir=./outputs \
+  --interval_scale=1.06 \
+  --filter_method=gipuma \
+  --use_sger_lite \
+  --fusion_depth_source refined \
+  --fusion_confidence_source residual_calibrated
+
+  test的命令是什么？
+
+
+• 推荐先测试默认的 raw depth + raw confidence：
+
+  python test.py \
+    --dataset general_eval \
+    --batch_size 1 \
+    --testpath data/DTU/dtu_test_all \
+    --testlist lists/dtu/test.txt \
+    --loadckpt ./checkpoints/sger_lite_stage3_safe/model_000012.ckpt \
+    --outdir ./outputs/test12_raw \
+    --interval_scale 1.06 \
+    --filter_method gipuma \
+    --use_sger_lite \
+    --fusion_depth_source raw \
+    --fusion_confidence_source raw
+
+  实验12建议同时运行三组对比。
+
+  A：refined depth + raw confidence
+
+  python test.py \
+    --dataset general_eval \
+    --batch_size 1 \
+    --testpath data/DTU/dtu_test_all \
+    --testlist lists/dtu/test.txt \
+    --loadckpt ./checkpoints/sger_lite_stage3_safe/model_000012.ckpt \
+    --outdir ./outputs/test12_refined_raw_conf \
+    --interval_scale 1.06 \
+    --filter_method gipuma \
+    --use_sger_lite \
+    --fusion_depth_source refined \
+    --fusion_confidence_source raw
+
+  B：refined depth + 温和校准置信度
+
+  python test.py \
+    --dataset general_eval \
+    --batch_size 1 \
+    --testpath data/DTU/dtu_test_all \
+    --testlist lists/dtu/test.txt \
+    --loadckpt ./checkpoints/sger_lite_stage3_safe/model_000012.ckpt \
+    --outdir ./outputs/test12_refined_calibrated \
+    --interval_scale 1.06 \
+    --filter_method gipuma \
+    --use_sger_lite \
+    --fusion_depth_source refined \
+    --fusion_confidence_source residual_calibrated \
+    --confidence_residual_alpha 0.25 \
+    --confidence_residual_floor 0.5
+
+  C：raw depth + raw confidence，即第一条命令，也是当前推荐的默认评估配置。
+
+  请将 checkpoint 路径中的 model_000012.ckpt 替换成实际要评估的文件。
+
+
+  3-4
+./train.sh 1 ./checkpoints/cas_dtu     --ndepths "48,32,8"     --depth_inter_r "4,2,1"     --dlossw "0.5,1.0,2.0"     --batch_size 2     --eva
+l_freq 3 --use_sger_lite  --sger_max_residual_ratio 0.25 \
+    --raw_depth_loss_weight 1.0 \
+    --refined_depth_loss_weight 1.0 \
+    --residual_loss_weight 0.01 \
+    --gate_loss_weight 0.001 \
+    --safe_refine_loss_weight 0.1 \
+    --safe_refine_margin 0.0 \
+    --freeze_backbone_epochs 0 \
+    --backbone_lr_scale 1.0
+
+python test.py   --dataset=general_eval   --batch_size=1   --testpath=data/DTU/dtu_test_all   --testlist=lists/dtu/test.txt   --loadckpt=./che
+ckpoints/cas_dtu/model_000015.ckpt   --outdir=./outputs   --interval_scale=1.06   --filter_method=gipuma   --use_sger_lite --fusion_depth_source refined --fusion_confidence_source residual_calibrated --confidence_residual_alpha 0.25 --confidence_residual_floor 0.5
+
+
+3-5：
+./train.sh 1 ./checkpoints/cas_dtu     --ndepths "48,32,8"     --depth_inter_r "4,2,1"     --dlossw "0.5,1.0,2.0"     --batch_size 2     --eval_freq 3 --use_sger_lite  --sger_max_residual_ratio 0.25 \
+    --raw_depth_loss_weight 1.0 \
+    --refined_depth_loss_weight 1.0 \
+    --residual_loss_weight 0.01 \
+    --gate_loss_weight 0.001 \
+    --safe_refine_loss_weight 0.1 \
+    --safe_refine_margin 0.0 \
+    --freeze_backbone_epochs 0 \
+    --backbone_lr_scale 1.0 --sger_warmup_start_epoch 3 \
+    --sger_warmup_end_epoch 6
+
+A组：refined depth + raw confidence
+
+  python test.py  --dataset=general_eval  --batch_size=1  --testpath=data/DTU/dtu_test_all  --testlist=lists/dtu/test.txt  --loadckpt=./checkpoints/cas_dtu_exp13/model_000015.ckpt  --outdir=./outputs  --interval_scale=1.06  --filter_method=gipuma  --use_sger_lite  --sger_max_residual_ratio=0.25  --fusion_depth_source=refined  --fusion_confidence_source=raw
+
+  B组：refined depth + residual-calibrated confidence
+
+  python test.py --dataset=general_eval  --batch_size=1  --testpath=data/DTU/dtu_test_all  --testlist=lists/dtu/test.txt  --loadckpt=./checkpoints/cas_dtu_exp13/model_000015.ckpt  --outdir=./outputs  --interval_scale=1.06  --filter_method=gipuma  --use_sger_lite  --sger_max_residual_ratio=0.25  --fusion_depth_source=refined  --fusion_confidence_source=residual_calibrated  --confidence_residual_alpha=0.25  --confidence_residual_floor=0.5
+
+  C组：raw depth + raw confidence，检查原始主干效果
+
+  python test.py  --dataset=general_eval  --batch_size=1  --testpath=data/DTU/dtu_test_all  --testlist=lists/dtu/test.txt  --loadckpt=./checkpoints/cas_dtu_exp13/model_000015.ckpt  --outdir=./outputs  --interval_scale=1.06  --filter_method=gipuma  --use_sger_lite  --sger_max_residual_ratio=0.25  --fusion_depth_source=raw  --fusion_confidence_source=raw
+
+3-6（14）
+训练：
+
+  bash train.sh 1 ./checkpoints/experiment14 --use_sger_lite --ndepths "48,32,8" --depth_inter_r "4,2,1" --dlossw "0.5,1.0,2.0" \
+  --batch_size 2 --epochs 16 --sger_max_residual_ratio 0.25 --raw_depth_loss_weight 1.0 --refined_depth_loss_weight 1.0 \
+  --residual_loss_weight 0.01 --gate_loss_weight 0.0 --safe_refine_loss_weight 0.1 --residual_target_loss_weight 0.05 \
+  --gate_benefit_loss_weight 0.05 --residual_target_ratio 0.25 --benefit_margin_ratio 0.05 --freeze_backbone_epochs 8 --backbone_lr_scale \
+  0.1 --sger_warmup_start_epoch 7 --sger_warmup_end_epoch 10
+
+  测试：
+
+  bash test.sh ./checkpoints/cas_dtu_exp14/model_000015.ckpt --outdir ./outputs --interval_scale 1.06 --use_sger_lite  --sger_max_residual_ratio 0.25 --fusion_depth_source refined --fusion_confidence_source raw
+python test.py --dataset general_eval --batch_size 1 --testpath data/DTU/dtu_test_all --testlist lists/dtu/test.txt --loadckpt ./checkpoints/cas_dtu_exp14/model_000015.ckpt --outdir ./outputs --interval_scale 1.06 --use_sger_lite --sger_max_residual_ratio 0.25 --fusion_depth_source refined --fusion_confidence_source raw --filter_method gipuma
+
+exp15-A:
+
+bash train.sh 1 ./checkpoints/experiment15_a_no_early_freeze --ndepths "48,32,8" --depth_inter_r "4,2,1" --dlossw "0.5,1.0,2.0" --batch_size 2 --eval_freq 3 --seed 1 --use_sger_lite --sger_max_residual_ratio 0.25 --raw_depth_loss_weight 1.0 --refined_depth_loss_weight 1.0 --residual_loss_weight 0.01 --gate_loss_weight 0.0 --safe_refine_loss_weight 0.1 --safe_refine_margin 0.0 --residual_target_loss_weight 0.05 --gate_benefit_loss_weight 0.05 --residual_target_ratio 0.25 --benefit_margin_ratio 0.05 --freeze_backbone_epochs 0 --backbone_lr_scale 0.1 --sger_warmup_start_epoch 7 --sger_warmup_end_epoch 10
+
+python test.py --dataset general_eval --batch_size 1 --testpath data/DTU/dtu_test_all --testlist lists/dtu/test.txt --loadckpt ./checkpoints/experiment15_b_backbone_lr1/model_000015.ckpt --outdir ./outputs --interval_scale 1.06 --use_sger_lite --sger_max_residual_ratio 0.25 --fusion_depth_source raw --fusion_confidence_source raw --filter_method gipuma
+
+exp15-B:
+bash train.sh 1 ./checkpoints/experiment15_b_backbone_lr1 --ndepths "48,32,8" --depth_inter_r "4,2,1" --dlossw "0.5,1.0,2.0" --batch_size 2 --eval_freq 3 --seed 1 --use_sger_lite --sger_max_residual_ratio 0.25 --raw_depth_loss_weight 1.0 --refined_depth_loss_weight 1.0 --residual_loss_weight 0.01 --gate_loss_weight 0.0 --safe_refine_loss_weight 0.1 --safe_refine_margin 0.0 --residual_target_loss_weight 0.05 --gate_benefit_loss_weight 0.05 --residual_target_ratio 0.25 --benefit_margin_ratio 0.05 --freeze_backbone_epochs 0 --backbone_lr_scale 1.0 --sger_warmup_start_epoch 7 --sger_warmup_end_epoch 10

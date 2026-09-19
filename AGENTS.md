@@ -6,6 +6,8 @@ This repository implements CasMVSNet training, evaluation, and data conversion u
 
 ## SGER-CasMVSNet Project Identity
 
+Before changing network architecture, losses, training schedules, gradient paths, inference/fusion, or experiment reports, read and follow [SGER_RULES.md](project_rules/SGER_RULES.md). It is the project-wide rulebook for SGER-centered design, explicit optimization boundaries, evidence-based improvements, and fair raw-versus-refined evaluation. Experiment-specific hyperparameters and targets belong in individual experiment records, not in the project-wide rules. Keep the rulebook synchronized when project policies change.
+
 The official Chinese full name of **SGER-CasMVSNet** is **自几何与边缘细化残差-CasMVSNet网络**. Use this exact name in project documentation, experiment reports, architecture descriptions, and research summaries. Do not redefine SGER as a generic post-processing module or omit its role when naming the proposed network.
 
 SGER is the central research contribution of this project. CasMVSNet provides the multi-view matching, cascade depth estimation, and raw-depth backbone, while SGER provides the defining self-geometry, edge-aware, and residual-refinement mechanism. Future architecture design, loss design, training strategies, ablation studies, and improvement proposals must remain centered on making SGER effective, reliable, and measurably beneficial. A raw CasMVSNet path may be retained as a protected backbone, control group, fallback, or source of supervision, but it must not replace SGER as the final research focus.

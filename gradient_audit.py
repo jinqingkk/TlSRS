@@ -10,9 +10,13 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from residual_audit_utils import capture_residual_outputs, residual_diagnostics
+from gate_audit_utils import capture_gate_outputs, gate_diagnostics
 from datasets import find_dataset_def
-from gradient_audit_utils import build_audit_cases, run_audit_suite
+from gradient_audit_utils import build_audit_cases, run_audit_suite, _write_json_atomic
+from models.sger_refinement import ResidualDepthHead
 from models import CascadeMVSNet, cas_mvsnet_loss
+from gate_bce_audit_utils import bce_forward_tensors, compare_forward
 
 
 def build_parser():
@@ -20,7 +24,7 @@ def build_parser():
         description="Experiment 15-C single-batch SGER gradient audit")
     parser.add_argument("--trainpath", required=True)
     parser.add_argument("--trainlist", required=True)
-    parser.add_argument("--loadckpt", required=True)
+    parser.add_argument("--loadckpt", default=None)
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--audit_epoch", type=int, required=True,
                         help="zero-based epoch index used by SGER schedules")
@@ -28,6 +32,16 @@ def build_parser():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--gate_bce_mode", choices=("legacy_clamp", "stable_logprob"),
+                        default="legacy_clamp")
+    parser.add_argument("--gate_bce_ab", action="store_true",
+                        help="pair legacy/stable BCE with a fixed activation")
+    parser.add_argument("--activation_ab", action="store_true",
+                        help="audit ReLU and LeakyReLU on identical weights and batches")
+    parser.add_argument("--verbose_activation_progress", action="store_true",
+                        help="print timing for each residual activation statistic")
+    parser.add_argument("--batch_indices", default="0",
+                        help="comma-separated zero-based fixed batch indices, e.g. 0,1,2,3,4")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--nviews", type=int, default=3)
     parser.add_argument("--numdepth", type=int, default=192)
@@ -50,9 +64,11 @@ def build_parser():
     parser.add_argument("--sger_hidden_channels", type=int, default=32)
     parser.add_argument("--sger_gate_channels", type=int, default=16)
     parser.add_argument("--sger_max_residual_ratio", type=float, default=0.25)
+    parser.add_argument("--sger_residual_final_activation", choices=("relu", "leaky_relu"), default="relu")
+    parser.add_argument("--sger_residual_negative_slope", type=float, default=0.01)
     parser.add_argument("--sger_warmup_start_epoch", type=int, default=7)
     parser.add_argument("--sger_warmup_end_epoch", type=int, default=10)
-    parser.add_argument("--freeze_backbone_epochs", type=int, default=8)
+    parser.add_argument("--freeze_backbone_epochs", type=int, default=0)
     parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
 
     parser.add_argument("--lr", type=float, default=0.001)
@@ -172,6 +188,7 @@ def _base_loss_weights(args):
 def _loss_kwargs(args, sample, case):
     values = dict(case.loss_weights)
     values.update({
+        "gate_bce_mode": args.gate_bce_mode,
         "imgs": sample["imgs"],
         "proj_matrices": sample["proj_matrices"],
         "dlossw": _parse_numbers(args.dlossw, float),
@@ -200,6 +217,31 @@ def _loss_kwargs(args, sample, case):
     return values
 
 
+def audit_loss_inputs(outputs, case):
+    """Use shallow stage copies to suppress unconditional coarse depth supervision.
+
+    Adding a depth_raw alias makes the production loss respect the zero raw
+    weight on stages without SGER. Forward tensors and gradient paths are intact.
+    """
+    if case.name.startswith("full_"):
+        return outputs
+    stages = {}
+    for key, value in outputs.items():
+        if key.startswith("stage") and key[5:].isdigit():
+            stage = dict(value)
+            stage.setdefault("depth_raw", stage["depth"])
+            stages[key] = stage
+    if case.name in ("refined_only", "residual_target_only",
+                     "gate_benefit_only", "safe_refine_only"):
+        stages = {key: value for key, value in stages.items()
+                  if "depth_refined" in value}
+    if case.name.startswith("stage3_"):
+        if "stage3" not in stages or "depth_refined" not in stages["stage3"]:
+            raise ValueError("Stage3 geometry audit requires Stage3 SGER outputs")
+        stages = {"stage3": stages["stage3"]}
+    return stages
+
+
 def _print_report(report, output_json):
     print("\nExperiment 15-C single-batch gradient audit")
     print("JSON report: {}".format(os.path.abspath(output_json)))
@@ -211,6 +253,7 @@ def _print_report(report, output_json):
                   raw=metrics.get("raw_abs_error"),
                   refined=metrics.get("refined_abs_error"),
                   delta=metrics.get("raw_to_refined_error_delta")))
+        print("  gradient_summary: {}".format(case["gradient_summary"]))
         for group_name in (
                 "normal_head", "sger_feature_projection",
                 "sger_residual_body", "sger_residual_output",
@@ -229,10 +272,12 @@ def _print_report(report, output_json):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.activation_ab and args.gate_bce_ab:
+        raise ValueError("activation_ab and gate_bce_ab must be separate experiments")
     if not args.use_sger_lite:
         raise ValueError("Experiment 15-C audit requires --use_sger_lite")
-    if args.batch_size != 1:
-        raise ValueError("single-batch audit requires --batch_size 1")
+    if args.batch_size < 1:
+        raise ValueError("batch_size must be positive")
     if args.num_workers != 0:
         raise ValueError("reproducible audit requires --num_workers 0")
     if not 0.0 < args.backbone_lr_scale <= 1.0:
@@ -262,6 +307,8 @@ def main(argv=None):
         sger_hidden_channels=args.sger_hidden_channels,
         sger_gate_channels=args.sger_gate_channels,
         sger_max_residual_ratio=args.sger_max_residual_ratio,
+        sger_residual_final_activation=args.sger_residual_final_activation,
+        sger_residual_negative_slope=args.sger_residual_negative_slope,
         detach_refined_feedback=True,
         sger_gate_kwargs={
             "threshold_edge": args.region_edge_threshold,
@@ -272,7 +319,8 @@ def main(argv=None):
             "smooth_k": args.region_smooth_k,
         },
     )
-    checkpoint_metadata = _load_checkpoint(model, args.loadckpt)
+    checkpoint_metadata = (_load_checkpoint(model, args.loadckpt)
+                           if args.loadckpt else {"initialization": "seeded_random"})
     model.to(device)
     model.train()
     optimizer = _build_optimizer(model, args)
@@ -286,28 +334,81 @@ def main(argv=None):
         args.trainpath, args.trainlist, "train", args.nviews,
         args.numdepth, args.interval_scale)
     loader = DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=0,
+        dataset, batch_size=args.batch_size, shuffle=False, num_workers=0,
         drop_last=False, pin_memory=False)
-    try:
-        sample = next(iter(loader))
-    except StopIteration:
-        raise RuntimeError("training dataset is empty")
-    sample = _move_to_device(sample, device)
+    batch_indices = _parse_numbers(args.batch_indices, int)
+    if (not batch_indices or len(set(batch_indices)) != len(batch_indices)
+            or any(index < 0 or index >= len(loader) for index in batch_indices)):
+        raise ValueError("batch_indices must be unique indices within the dataset batches")
     final_stage_key = "stage{}".format(len(ndepths))
 
     cases = build_audit_cases(
         args.audit_epoch, _base_loss_weights(args),
         args.sger_warmup_start_epoch, args.sger_warmup_end_epoch)
 
+    bce_reference = {}
+    bce_comparisons = {}
+    active_bce_mode = args.gate_bce_mode
+    ab_raw = {}
+    ab_comparison = {}
+
     def evaluate(case):
-        outputs = model(
-            sample["imgs"], sample["proj_matrices"],
-            sample["depth_values"])
+        with capture_gate_outputs(model) as captured, capture_residual_outputs(
+                model, progress=args.verbose_activation_progress) as residual_captured:
+            outputs = model(
+                sample["imgs"], sample["proj_matrices"],
+                sample["depth_values"])
+        if args.activation_ab and case.name == "full_schedule":
+            for key in ("depth_raw", "photometric_confidence"):
+                value = outputs[final_stage_key][key].detach().cpu()
+                if activation == "relu":
+                    ab_raw[key] = value.clone()
+                else:
+                    ab_comparison[key + "_max_abs_difference"] = float(
+                        (value - ab_raw[key]).abs().max().item())
+        if args.gate_bce_ab:
+            current = bce_forward_tensors(outputs[final_stage_key],
+                sample["depth"][final_stage_key], sample["mask"][final_stage_key],
+                args.benefit_margin_ratio)
+            if active_bce_mode == "legacy_clamp":
+                bce_reference[case.name] = current
+            else:
+                bce_comparisons[case.name] = compare_forward(bce_reference.pop(case.name), current)
+                if any(v != 0 for v in bce_comparisons[case.name].values()):
+                    raise RuntimeError("BCE A/B changed forward tensors: " + case.name)
+        diagnostics = {}
+        residual_stats = {}
+        for key, stage in outputs.items():
+            if key.startswith("stage") and key[5:].isdigit() and "benefit_gate" in stage:
+                residual_stats[key] = residual_diagnostics(
+                    stage, residual_captured.get(id(stage["raw_depth_residual"]), {}),
+                    sample["mask"][key])
+                diagnostics[key] = gate_diagnostics(
+                    stage, captured.get(id(stage["benefit_gate"]), {}),
+                    sample["depth"][key], sample["mask"][key], args.benefit_margin_ratio)
+        captured.clear()
+        residual_captured.clear()
+        loss_options = _loss_kwargs(args, sample, case)
+        loss_options["gate_bce_mode"] = active_bce_mode
         loss_result = cas_mvsnet_loss(
-            outputs, sample["depth"], sample["mask"],
-            **_loss_kwargs(args, sample, case))
+            audit_loss_inputs(outputs, case), sample["depth"], sample["mask"],
+            **loss_options)
         loss = loss_result[0]
-        extras = loss_result[-1]
+        extras = dict(loss_result[-1])
+        extras["actual_gate_bce_mode"] = active_bce_mode
+        extras["benefit_margin_ratio"] = args.benefit_margin_ratio
+        extras["gate_diagnostics"] = diagnostics
+        extras["residual_diagnostics"] = residual_stats
+        stage = outputs[final_stage_key]
+        maximum = args.sger_max_residual_ratio * float(stage["depth_interval"])
+        extras["residual_bound_checks"] = {
+            "max_abs_proposal": stage["raw_depth_residual"].detach().abs().max(),
+            "max_abs_effective_residual": stage["depth_residual"].detach().abs().max(),
+            "proposal_bound": maximum,
+            "effective_bound": maximum * case.sger_scale,
+            "proposal_all_finite": bool(torch.isfinite(stage["raw_depth_residual"]).all()),
+            "effective_all_finite": bool(torch.isfinite(stage["depth_residual"]).all()),
+        }
         return (
             outputs, loss, extras,
             sample["depth"][final_stage_key],
@@ -316,7 +417,10 @@ def main(argv=None):
 
     metadata = {
         "audit_epoch": args.audit_epoch,
-        "checkpoint": os.path.abspath(args.loadckpt),
+        "checkpoint": os.path.abspath(args.loadckpt) if args.loadckpt else None,
+        "arguments": vars(args),
+        "torch_version": torch.__version__,
+        "batch_selection": "first batch, shuffle=False",
         "dataset": args.dataset,
         "trainpath": os.path.abspath(args.trainpath),
         "trainlist": os.path.abspath(args.trainlist),
@@ -325,13 +429,95 @@ def main(argv=None):
         "freeze_backbone": freeze_backbone,
     }
     metadata.update(checkpoint_metadata)
-    report = run_audit_suite(
-        model, optimizer, cases, evaluate,
-        final_stage_key=final_stage_key,
-        output_json=args.output_json,
-        metadata=metadata)
-    _print_report(report, args.output_json)
-    return 1 if report["fatal_errors"] else 0
+    failed = False
+    # Direct batch sampler records exact dataset indices and avoids loading
+    # skipped batches. Each suite restores weights/BN before the next batch.
+    selections = [list(range(index * args.batch_size,
+                             min((index + 1) * args.batch_size, len(dataset))))
+                  for index in batch_indices]
+    selected_loader = DataLoader(dataset, batch_sampler=selections,
+                                 num_workers=0, pin_memory=False)
+    for batch_index, indices, cpu_sample in zip(batch_indices, selections, selected_loader):
+        sample = _move_to_device(cpu_sample, device)
+        batch_metadata = dict(metadata)
+        batch_metadata.update(batch_selection="fixed indices, shuffle=False",
+                              batch_index=batch_index, dataset_indices=indices,
+                              model_mode="train")
+        if hasattr(dataset, "metas"):
+            batch_metadata["sample_metas"] = [dataset.metas[i] for i in indices]
+        path = args.output_json
+        if len(batch_indices) > 1 or args.gate_bce_ab:
+            stem, extension = os.path.splitext(path)
+            path = "{}_batch{:04d}{}".format(stem, batch_index, extension or ".json")
+        print("Auditing batch {} (dataset indices {})".format(batch_index, indices), flush=True)
+        variants = ("relu", "leaky_relu") if args.activation_ab else (args.sger_residual_final_activation,)
+        if args.gate_bce_ab:
+            variants = ("legacy_clamp", "stable_logprob")
+        heads = [m for m in model.modules() if isinstance(m, ResidualDepthHead)]
+        original_activations = [head.body[5] for head in heads]
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        variant_reports = {}
+        bce_reference.clear()
+        bce_comparisons.clear()
+        ab_raw.clear()
+        ab_comparison.clear()
+        try:
+            for variant in variants:
+                activation = args.sger_residual_final_activation if args.gate_bce_ab else variant
+                active_bce_mode = variant if args.gate_bce_ab else args.gate_bce_mode
+                for head in heads:
+                    head.set_final_activation(activation, args.sger_residual_negative_slope)
+                torch.set_rng_state(cpu_rng)
+                if cuda_rng is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng)
+                variant_metadata = dict(batch_metadata)
+                variant_metadata.update(actual_gate_bce_mode=active_bce_mode,
+                                        actual_residual_final_activation=activation,
+                                        actual_residual_negative_slope=(
+                                            args.sger_residual_negative_slope if activation == "leaky_relu" else 0.0))
+                variant_path = path
+                if args.activation_ab:
+                    stem, extension = os.path.splitext(path)
+                    variant_path = stem + "_" + activation + (extension or ".json")
+                if args.gate_bce_ab:
+                    stem, extension = os.path.splitext(path)
+                    variant_path = stem + "_" + activation + "_" + active_bce_mode + (extension or ".json")
+                report = run_audit_suite(
+                    model, optimizer, cases, evaluate,
+                    final_stage_key=final_stage_key,
+                    output_json=variant_path, metadata=variant_metadata)
+                _print_report(report, variant_path)
+                failed = failed or bool(report["fatal_errors"])
+                variant_reports[variant] = {
+                    "report": os.path.abspath(variant_path),
+                    "fatal_errors": report["fatal_errors"],
+                    "full_schedule": report["cases"][0]["forward_metrics"],
+                    "residual_target_gradient_summary": next(
+                        c["gradient_summary"] for c in report["cases"]
+                        if c["name"] == "residual_target_only"),
+                }
+        finally:
+            for head, original in zip(heads, original_activations):
+                head.body[5] = original
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+        if args.activation_ab:
+            stem, extension = os.path.splitext(path)
+            _write_json_atomic(stem + "_ab_comparison" + (extension or ".json"), {
+                "metadata": batch_metadata, "variants": variant_reports,
+                "full_schedule_raw_invariance": ab_comparison,
+                "note": "Same batch, weights and BN state; no optimizer step. Nonzero gradients do not prove quality gains."})
+        if args.gate_bce_ab:
+            stem, extension = os.path.splitext(path)
+            _write_json_atomic(stem + "_" + activation + "_bce_comparison" + (extension or ".json"), {
+                "metadata": batch_metadata, "variants": variant_reports,
+                "case_forward_invariance": bce_comparisons,
+                "note": "Fixed activation, same weights/BN/RNG; loss-only A/B, no optimizer step."})
+        del sample
+    return 1 if failed else 0
+
 
 
 if __name__ == "__main__":

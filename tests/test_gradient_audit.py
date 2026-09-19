@@ -16,7 +16,7 @@ from gradient_audit_utils import (
     register_output_gradients,
     run_audit_suite,
 )
-from gradient_audit import build_parser
+from gradient_audit import build_parser, audit_loss_inputs
 
 
 def test_builds_six_cases_with_expected_isolation():
@@ -47,6 +47,15 @@ def test_builds_six_cases_with_expected_isolation():
         "residual_target_only",
         "gate_benefit_only",
         "safe_refine_only",
+        "raw_only",
+        "normal_smooth_only",
+        "curvature_only",
+        "edge_smooth_only",
+        "depth_normal_only",
+        "stage3_normal_smooth_only",
+        "stage3_curvature_only",
+        "stage3_edge_smooth_only",
+        "stage3_depth_normal_only",
     ]
     assert math.isclose(cases[0].sger_scale, 0.5)
     assert cases[0].residual_target_scale == 1.0
@@ -61,14 +70,19 @@ def test_builds_six_cases_with_expected_isolation():
         "residual_target_only": "residual_target_loss_weight",
         "gate_benefit_only": "gate_benefit_loss_weight",
         "safe_refine_only": "safe_refine_loss_weight",
+        "raw_only": "raw_depth_loss_weight",
+        "normal_smooth_only": "normal_smooth_loss_weight",
+        "curvature_only": "curv_loss_weight",
+        "edge_smooth_only": "edge_smooth_loss_weight",
+        "depth_normal_only": "depth_normal_loss_weight",
     }
     for name, case in isolated.items():
         for key, value in case.loss_weights.items():
-            if key == expected_nonzero[name]:
+            if key == expected_nonzero[name.replace("stage3_", "")]:
                 assert value == 1.0
             elif key != "raw_depth_loss_weight":
                 assert value == 0.0
-        assert case.loss_weights["raw_depth_loss_weight"] == 0.0
+        assert case.loss_weights["raw_depth_loss_weight"] == (1.0 if name == "raw_only" else 0.0)
 
 
 def test_gradient_stats_handle_missing_zero_and_nonfinite():

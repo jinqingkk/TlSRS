@@ -5,12 +5,15 @@ import json
 import math
 import os
 import tempfile
+import time
 from collections import namedtuple
 
 import torch
 
 
 AUDIT_TENSOR_KEYS = (
+    "gate_logits_a",
+    "gate_logits_b",
     "depth_raw",
     "raw_depth_residual",
     "benefit_gate",
@@ -88,11 +91,21 @@ def build_audit_cases(epoch_idx, base_weights,
         ("residual_target_only", "residual_target_loss_weight"),
         ("gate_benefit_only", "gate_benefit_loss_weight"),
         ("safe_refine_only", "safe_refine_loss_weight"),
+        ("raw_only", "raw_depth_loss_weight"),
+        ("normal_smooth_only", "normal_smooth_loss_weight"),
+        ("curvature_only", "curv_loss_weight"),
+        ("edge_smooth_only", "edge_smooth_loss_weight"),
+        ("depth_normal_only", "depth_normal_loss_weight"),
     )
     for name, active_key in isolated:
         weights = {key: 0.0 for key in LOSS_WEIGHT_KEYS}
         weights[active_key] = 1.0
         cases.append(AuditCase(name, weights, 1.0, 1.0, 1.0))
+    for name, active_key in isolated:
+        if name in ("normal_smooth_only", "curvature_only", "edge_smooth_only", "depth_normal_only"):
+            weights = {key: 0.0 for key in LOSS_WEIGHT_KEYS}
+            weights[active_key] = 1.0
+            cases.append(AuditCase("stage3_" + name, weights, 1.0, 1.0, 1.0))
     return cases
 
 
@@ -176,6 +189,8 @@ def parameter_group_stats(model, optimizer, final_stage_index):
             "parameter_tensors": 0,
             "parameter_values": 0,
             "missing_grad_tensors": 0,
+            "zero_grad_tensors": 0,
+            "frozen_parameter_tensors": 0,
             "missing_optimizer_tensors": 0,
             "nonfinite_values": 0,
             "grad_values": 0,
@@ -186,6 +201,7 @@ def parameter_group_stats(model, optimizer, final_stage_index):
             "missing_optimizer_names": [],
         })
         group["parameter_tensors"] += 1
+        group["frozen_parameter_tensors"] += int(not parameter.requires_grad)
         group["parameter_values"] += int(parameter.numel())
         if id(parameter) not in optimizer_ids:
             group["missing_optimizer_tensors"] += 1
@@ -196,6 +212,8 @@ def parameter_group_stats(model, optimizer, final_stage_index):
             continue
         grad = parameter.grad.detach().float()
         finite_mask = torch.isfinite(grad)
+        if bool(finite_mask.all().item()) and not bool((grad != 0).any().item()):
+            group["zero_grad_tensors"] += 1
         finite = grad[finite_mask]
         group["nonfinite_values"] += int((~finite_mask).sum().item())
         group["grad_values"] += int(finite.numel())
@@ -211,6 +229,34 @@ def parameter_group_stats(model, optimizer, final_stage_index):
             if group["grad_values"] else 0.0)
         group["all_finite"] = group["nonfinite_values"] == 0
     return groups
+
+
+def summarize_gradient_boundary(groups, case_name, tolerance=1e-8):
+    """Aggregate disjoint parameter groups; geometry cases span raw and refined stages."""
+    def norm(names):
+        return math.sqrt(sum(groups.get(name, {}).get("l2", 0.0) ** 2
+                             for name in names))
+    backbone = norm(("backbone_feature", "cost_regularization"))
+    sger = norm([name for name in groups
+                 if name.startswith("sger_") or name == "normal_head"])
+    exclusive = case_name in ("refined_only", "residual_target_only",
+                              "gate_benefit_only", "safe_refine_only")
+    exclusive = exclusive or case_name.startswith("stage3_")
+    finite = all(group["all_finite"] for group in groups.values())
+    return {
+        "backbone_grad_norm": backbone,
+        "feature_net_grad_norm": norm(("backbone_feature",)),
+        "cost_reg_net_grad_norm": norm(("cost_regularization",)),
+        "normal_head_grad_norm": norm(("normal_head",)),
+        "residual_head_grad_norm": norm(("sger_residual_body", "sger_residual_output")),
+        "benefit_gate_grad_norm": norm(("sger_gate_a", "sger_gate_b")),
+        "sger_grad_norm": sger,
+        "backbone_to_sger_grad_ratio": backbone / sger if sger > 0 else None,
+        "leakage_tolerance": tolerance,
+        "sger_exclusive": exclusive,
+        "backbone_leak_detected": backbone > tolerance if exclusive and finite else None,
+        "all_finite": finite,
+    }
 
 
 def register_output_gradients(outputs):
@@ -401,7 +447,12 @@ def _write_json_atomic(path, report):
 def run_audit_suite(model, optimizer, cases, evaluate,
                     final_stage_key="stage3", output_json=None,
                     metadata=None):
+    from residual_audit_utils import residual_parameter_gradients
+
     module = model.module if hasattr(model, "module") else model
+    initial_cpu_rng = torch.get_rng_state()
+    initial_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    initial_scale = getattr(module, "sger_residual_scale", 1.0)
     initial_state = {
         key: value.detach().cpu().clone()
         for key, value in module.state_dict().items()
@@ -414,11 +465,22 @@ def run_audit_suite(model, optimizer, cases, evaluate,
         "fatal_errors": [],
     }
     try:
-        for case in cases:
+        for case_index, case in enumerate(cases):
+            started = time.monotonic()
+            print("  [{}/{} {}] restoring model".format(
+                case_index + 1, len(cases), case.name), flush=True)
+            torch.set_rng_state(initial_cpu_rng)
+            if initial_cuda_rng is not None:
+                torch.cuda.set_rng_state_all(initial_cuda_rng)
             module.load_state_dict(copy.deepcopy(initial_state))
-            optimizer.zero_grad()
+            module.zero_grad()
+            for parameter in module.parameters():
+                parameter.grad = None
             module.set_sger_residual_scale(case.sger_scale)
+            print("    forward and diagnostics", flush=True)
             outputs, loss, extras, depth_gt, valid_mask = evaluate(case)
+            print("    forward/diagnostics finished ({:.1f}s); backward".format(
+                time.monotonic() - started), flush=True)
             registration = register_output_gradients(outputs)
             case_errors = []
             case_warnings = []
@@ -432,7 +494,11 @@ def run_audit_suite(model, optimizer, cases, evaluate,
             if not bool(torch.isfinite(loss.detach()).all().item()):
                 case_errors.append("non-finite total loss")
             if not case_errors:
-                loss.backward()
+                if loss.requires_grad:
+                    loss.backward()
+                else:
+                    case_warnings.append("loss has no autograd path")
+            print("    backward finished; collecting gradient statistics", flush=True)
             tensor_gradients = output_gradient_stats(outputs, registration)
             parameter_gradients = parameter_group_stats(
                 module, optimizer, final_stage_index)
@@ -462,6 +528,10 @@ def run_audit_suite(model, optimizer, cases, evaluate,
                 if (case.name == "safe_refine_only"
                         and loss_value == 0.0):
                     case_warnings.append("safe-refine hinge is inactive")
+            if stage is not None and "gate_logits_a" in stage:
+                from gate_bce_audit_utils import gate_bce_gradient_diagnostics
+                extras["gate_bce_gradients"] = gate_bce_gradient_diagnostics(
+                    stage, depth_gt, valid_mask, extras.get("benefit_margin_ratio", 0.05))
             case_report = {
                 "name": case.name,
                 "loss": _safe_float(loss.detach().float().item()),
@@ -475,17 +545,25 @@ def run_audit_suite(model, optimizer, cases, evaluate,
                 "forward_metrics": forward_metrics,
                 "tensor_gradients": tensor_gradients,
                 "parameter_gradients": parameter_gradients,
+                "residual_parameter_gradients": residual_parameter_gradients(module, optimizer),
+                "gradient_summary": summarize_gradient_boundary(parameter_gradients, case.name),
                 "direction_checks": directions,
                 "warnings": case_warnings,
                 "fatal_errors": case_errors,
             }
             report["cases"].append(case_report)
+            print("    {} complete ({:.1f}s)".format(
+                case.name, time.monotonic() - started), flush=True)
             report["fatal_errors"].extend(
                 "{}: {}".format(case.name, message)
                 for message in case_errors)
     finally:
+        torch.set_rng_state(initial_cpu_rng)
+        if initial_cuda_rng is not None:
+            torch.cuda.set_rng_state_all(initial_cuda_rng)
         module.load_state_dict(initial_state)
-        optimizer.zero_grad()
+        module.set_sger_residual_scale(initial_scale)
+        module.zero_grad()
     if output_json is not None:
         _write_json_atomic(output_json, report)
     return report

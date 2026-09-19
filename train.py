@@ -78,6 +78,8 @@ parser.add_argument('--sger_feature_channels', type=int, default=8, help='projec
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
 parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
+parser.add_argument("--sger_residual_final_activation", choices=("relu", "leaky_relu"), default="relu")
+parser.add_argument("--sger_residual_negative_slope", type=float, default=0.01)
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--raw_depth_loss_weight', type=float, default=1.0, help='auxiliary raw stage depth loss weight')
@@ -88,6 +90,7 @@ parser.add_argument('--safe_refine_loss_weight', type=float, default=0.1, help='
 parser.add_argument('--safe_refine_margin', type=float, default=0.0, help='raw-to-refined safety loss margin')
 parser.add_argument('--residual_target_loss_weight', type=float, default=0.05, help='bounded SGER residual proposal supervision weight')
 parser.add_argument('--gate_benefit_loss_weight', type=float, default=0.05, help='benefit-supervised SGER gate loss weight')
+parser.add_argument('--gate_bce_mode', choices=('legacy_clamp', 'stable_logprob'), default='legacy_clamp', help='SGER benefit BCE numerical implementation')
 parser.add_argument('--residual_target_ratio', type=float, default=0.25, help='maximum residual target in stage depth intervals')
 parser.add_argument('--benefit_margin_ratio', type=float, default=0.05, help='minimum proposal improvement in stage depth intervals')
 parser.add_argument('--freeze_backbone_epochs', type=int, default=8, help='freeze non-SGER-Lite backbone for the first N epochs')
@@ -119,6 +122,7 @@ def loss_kwargs(sample_cuda, args):
         "safe_refine_margin": args.safe_refine_margin,
         "residual_target_loss_weight": args.residual_target_loss_weight,
         "gate_benefit_loss_weight": args.gate_benefit_loss_weight,
+        "gate_bce_mode": getattr(args, "gate_bce_mode", "legacy_clamp"),
         "residual_target_ratio": args.residual_target_ratio,
         "benefit_margin_ratio": args.benefit_margin_ratio,
         "residual_target_loss_scale": getattr(
@@ -337,6 +341,9 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
                     'epoch': epoch_idx,
                     'model': model.module.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'gate_bce_mode': args.gate_bce_mode,
+                    'sger_residual_final_activation': args.sger_residual_final_activation,
+                    'sger_residual_negative_slope': args.sger_residual_negative_slope,
                     'sger_warmup_start_epoch': args.sger_warmup_start_epoch,
                     'sger_warmup_end_epoch': args.sger_warmup_end_epoch},
                     "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
@@ -601,6 +608,8 @@ if __name__ == '__main__':
                           sger_hidden_channels=args.sger_hidden_channels,
                           sger_gate_channels=args.sger_gate_channels,
                           sger_max_residual_ratio=args.sger_max_residual_ratio,
+                          sger_residual_final_activation=args.sger_residual_final_activation,
+                          sger_residual_negative_slope=args.sger_residual_negative_slope,
                           detach_refined_feedback=args.detach_refined_feedback,
                           sger_gate_kwargs={
                               "threshold_edge": args.region_edge_threshold,
@@ -633,6 +642,8 @@ if __name__ == '__main__':
         loadckpt = os.path.join(args.logdir, saved_models[-1])
         print("resuming", loadckpt)
         state_dict = torch.load(loadckpt, map_location=torch.device("cpu"))
+        print("checkpoint gate BCE:", state_dict.get("gate_bce_mode", "legacy_clamp"),
+              "requested gate BCE:", args.gate_bce_mode)
         validate_sger_warmup_checkpoint(state_dict, args)
         model.load_state_dict(state_dict['model'])
         optimizer.load_state_dict(state_dict['optimizer'])
@@ -641,6 +652,8 @@ if __name__ == '__main__':
         # load checkpoint file specified by args.loadckpt
         print("loading model {}".format(args.loadckpt))
         state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
+        print("checkpoint gate BCE:", state_dict.get("gate_bce_mode", "legacy_clamp"),
+              "requested gate BCE:", args.gate_bce_mode)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict['model'], strict=False)
         validate_checkpoint_keys(missing_keys, unexpected_keys, args.use_sger, args.use_sger_lite)
         if missing_keys:

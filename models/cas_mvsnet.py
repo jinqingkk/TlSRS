@@ -106,7 +106,8 @@ class CascadeMVSNet(nn.Module):
                  use_sger_lite=False,
                  sger_share=False, sger_feature_channels=8, sger_hidden_channels=32,
                  sger_gate_channels=16, sger_max_residual_ratio=0.5,
-                 detach_refined_feedback=True, sger_gate_kwargs=None):
+                 detach_refined_feedback=True, sger_gate_kwargs=None,
+                 sger_residual_final_activation="relu", sger_residual_negative_slope=0.01):
         super(CascadeMVSNet, self).__init__()
         if use_sger and use_sger_lite:
             raise ValueError("use_sger and use_sger_lite are mutually exclusive")
@@ -167,6 +168,8 @@ class CascadeMVSNet(nn.Module):
                     hidden_channels=sger_hidden_channels,
                     gate_channels=sger_gate_channels,
                     max_residual_ratio=sger_max_residual_ratio,
+                    residual_final_activation=sger_residual_final_activation,
+                    residual_negative_slope=sger_residual_negative_slope,
                     **self.sger_gate_kwargs)
             else:
                 self.sger_blocks = nn.ModuleList([
@@ -176,6 +179,8 @@ class CascadeMVSNet(nn.Module):
                         hidden_channels=sger_hidden_channels,
                         gate_channels=sger_gate_channels,
                         max_residual_ratio=sger_max_residual_ratio,
+                        residual_final_activation=sger_residual_final_activation,
+                        residual_negative_slope=sger_residual_negative_slope,
                         **self.sger_gate_kwargs)
                     for out_channels in (
                         [self.feature.out_channels[self.num_stage - 1]]
@@ -321,7 +326,8 @@ class CascadeMVSNet(nn.Module):
                 outputs_stage["depth"] = outputs_stage["depth_refined"]
                 outputs_stage["sger_residual_scale"] = depth_raw.new_tensor(
                     self.sger_residual_scale)
-                for key in ("benefit_gate", "geometry_gate", "region_a",
+                for key in ("gate_logits_a", "gate_logits_b", "gate_valid_mask",
+                            "benefit_gate", "geometry_gate", "region_a",
                             "region_b_weight", "normal_disagreement"):
                     outputs_stage[key] = sger_outputs[key]
                 depth = outputs_stage["depth_refined"]

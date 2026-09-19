@@ -892,7 +892,60 @@ def balanced_binary_cross_entropy(prediction, target, mask):
     return (losses * weights).sum() / (weights.sum() + 1e-6)
 
 
+def stable_gate_binary_cross_entropy(logits_a, logits_b, region_a, weight_b,
+                                     gate_valid, target, mask):
+    """Balanced BCE for the existing exclusive-region p = w * sigmoid(z).
+
+    Use branch logits before sigmoid rounding. Keep structural zeros exact;
+    an unreachable positive target is a domain error, not a new mask policy.
+    Geometry coefficients are fixed in the active model. No epsilon probability
+    floor or change to the original class balancing/normalization is introduced.
+    """
+    tensors = (logits_b, region_a, weight_b, gate_valid, target, mask)
+    if logits_a.dim() != 3 or any(t.shape != logits_a.shape for t in tensors):
+        raise ValueError("gate BCE tensors must have identical (B,H,W) shapes")
+    selected = mask > 0.5
+    if not bool(selected.any()):
+        return logits_a[selected].sum() + logits_b[selected].sum()
+    a = region_a[selected].bool()
+    wb = weight_b[selected]
+    if (not bool(torch.isfinite(wb).all()) or bool(((wb < 0) | (wb > 1)).any())
+            or bool((a & (wb != 0)).any())):
+        raise ValueError("gate BCE requires exclusive regions and weights in [0,1]")
+    z = torch.where(a, logits_a[selected], logits_b[selected])
+    w = (a.to(wb.dtype) + wb) * gate_valid[selected].to(wb.dtype)
+    y = target[selected].to(z.dtype).detach()
+    if not bool(torch.isfinite(z).all()) or bool(((y != 0) & (y != 1)).any()):
+        raise ValueError("gate BCE requires finite logits and binary targets")
+    unreachable = (w == 0) & (y > 0.5)
+    if bool(unreachable.any()):
+        raise ValueError("structurally unreachable positive gate targets: {}".format(
+            int(unreachable.sum().item())))
+    # Index before logarithms: torch.where does not prevent NaN gradients in
+    # an unselected log(0) branch. Coefficient 0 and 1 are handled exactly.
+    losses = z * 0.0
+    positive = y > 0.5
+    losses[positive] = F.softplus(-z[positive]) - torch.log(w[positive])
+    negative_unit = (~positive) & (w == 1)
+    losses[negative_unit] = F.softplus(z[negative_unit])
+    negative_scaled = (~positive) & (w > 0) & (w < 1)
+    zs, ws = z[negative_scaled], w[negative_scaled]
+    # For w < 1 the probability remains strictly below 1. log1p avoids
+    # cancellation near p=0; logsigmoid retains the derivative when a direct
+    # sigmoid(z) has rounded to 1. w=1 uses softplus above instead.
+    log_probability = torch.log(ws) + F.logsigmoid(zs)
+    losses[negative_scaled] = -torch.log1p(-torch.exp(log_probability))
+    positive_fraction = y.mean().detach()
+    if positive_fraction.item() <= 0.0 or positive_fraction.item() >= 1.0:
+        return losses.mean()
+    weights = torch.where(positive, 1.0 - positive_fraction, positive_fraction)
+    return (losses * weights).sum() / (weights.sum() + 1e-6)
+
+
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
+    gate_bce_mode = kwargs.get("gate_bce_mode", "legacy_clamp")
+    if gate_bce_mode not in ("legacy_clamp", "stable_logprob"):
+        raise ValueError("unknown gate_bce_mode: {}".format(gate_bce_mode))
     depth_loss_weights = kwargs.get("dlossw", None)
     raw_depth_loss_weight = kwargs.get("raw_depth_loss_weight", 0.5)
     refined_depth_loss_weight = kwargs.get("refined_depth_loss_weight", 1.0)
@@ -1058,8 +1111,14 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 benefit_margin_ratio)
             residual_target_loss = F.smooth_l1_loss(
                 raw_residual[mask], residual_target[mask], reduction="mean")
-            gate_benefit_loss = balanced_binary_cross_entropy(
-                benefit_gate, benefit_target, mask)
+            if gate_bce_mode == "stable_logprob":
+                gate_benefit_loss = stable_gate_binary_cross_entropy(
+                    stage_inputs["gate_logits_a"], stage_inputs["gate_logits_b"],
+                    stage_inputs["region_a"], stage_inputs["region_b_weight"],
+                    stage_inputs["gate_valid_mask"], benefit_target, mask)
+            else:
+                gate_benefit_loss = balanced_binary_cross_entropy(
+                    benefit_gate, benefit_target, mask)
             total_loss += (
                 effective_residual_target_loss_weight
                 * residual_target_loss)

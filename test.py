@@ -48,6 +48,8 @@ parser.add_argument('--sger_feature_channels', type=int, default=8, help='projec
 parser.add_argument('--sger_hidden_channels', type=int, default=32, help='SGER residual head channels')
 parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gate head channels')
 parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
+parser.add_argument("--sger_residual_final_activation", choices=("relu", "leaky_relu"), default="relu")
+parser.add_argument("--sger_residual_negative_slope", type=float, default=0.01)
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--allow_legacy_checkpoint', action='store_true', help='allow loading a checkpoint without SGER parameters')
@@ -244,6 +246,8 @@ def save_scene_depth(testlist):
                           sger_hidden_channels=args.sger_hidden_channels,
                           sger_gate_channels=args.sger_gate_channels,
                           sger_max_residual_ratio=args.sger_max_residual_ratio,
+                          sger_residual_final_activation=args.sger_residual_final_activation,
+                          sger_residual_negative_slope=args.sger_residual_negative_slope,
                           detach_refined_feedback=args.detach_refined_feedback,
                           sger_gate_kwargs={
                               "threshold_edge": args.region_edge_threshold,
