@@ -7,7 +7,7 @@ from .module import (
     compute_normal_from_depth,
     curvature_magnitude,
     depth_gradient_magnitude,
-    masked_mean,
+    masked_depth_mean,
     sobel_gradient_magnitude,
 )
 
@@ -21,6 +21,12 @@ def _as_depth_map(value):
 
 
 class GeometryCueExtractor(nn.Module):
+    def __init__(self, depth_normalization="batch"):
+        super(GeometryCueExtractor, self).__init__()
+        if depth_normalization not in ("batch", "sample"):
+            raise ValueError("depth_normalization must be batch or sample")
+        self.depth_normalization = depth_normalization
+
     def forward(self, depth, normal_pred, confidence, ref_img,
                 intrinsics, valid_mask=None):
         depth = _as_depth_map(depth)
@@ -46,15 +52,15 @@ class GeometryCueExtractor(nn.Module):
                 ref_img, size=target_size,
                 mode="bilinear", align_corners=False)
 
-        depth_mean = masked_mean(depth, valid_mask).detach()
+        depth_mean = masked_depth_mean(depth, valid_mask, self.depth_normalization)
         depth_normalized = depth / (depth_mean + 1e-6)
         normal_depth = compute_normal_from_depth(depth, intrinsics)
         normal_disagreement = 1.0 - torch.abs(
             (normal_pred * normal_depth).sum(dim=1)
         ).clamp(0.0, 1.0)
         image_edge = sobel_gradient_magnitude(ref_img, target_size)
-        depth_edge = depth_gradient_magnitude(depth, valid_mask)
-        curvature = curvature_magnitude(depth, valid_mask)
+        depth_edge = depth_gradient_magnitude(depth, valid_mask, self.depth_normalization)
+        curvature = curvature_magnitude(depth, valid_mask, self.depth_normalization)
 
         cue_tensor = torch.cat([
             depth_normalized.unsqueeze(1),
@@ -82,7 +88,8 @@ class DualRegionGate(nn.Module):
     def __init__(self, in_channels, hidden_channels=16,
                  threshold_edge=0.25, threshold_depth=0.02,
                  threshold_curv=0.02, conf_mid=0.65,
-                 k_conf=10.0, smooth_k=2.0):
+                 k_conf=10.0, smooth_k=2.0, depth_normalization="batch",
+                 proposal_conditioned=False):
         super(DualRegionGate, self).__init__()
         self.threshold_edge = threshold_edge
         self.threshold_depth = threshold_depth
@@ -90,6 +97,7 @@ class DualRegionGate(nn.Module):
         self.conf_mid = conf_mid
         self.k_conf = k_conf
         self.smooth_k = smooth_k
+        self.depth_normalization = depth_normalization
         self.gate_a = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -100,9 +108,17 @@ class DualRegionGate(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, 1, 3, padding=1),
         )
+        self.proposal_conditioned = proposal_conditioned
+        if proposal_conditioned:
+            # Zero initialization preserves the trained 15-E gate exactly.
+            # Signed proposal and magnitude are inference inputs, never GT.
+            self.proposal_a = nn.Conv2d(2, hidden_channels, 3, padding=1, bias=False)
+            self.proposal_b = nn.Conv2d(2, hidden_channels, 3, padding=1, bias=False)
+            nn.init.zeros_(self.proposal_a.weight)
+            nn.init.zeros_(self.proposal_b.weight)
 
     def forward(self, fused_features, ref_img, depth, confidence, valid_mask,
-                return_logits=False):
+                return_logits=False, proposal_cues=None):
         region_a, weight_b, _ = build_dual_region_geometry(
             ref_img,
             valid_mask,
@@ -115,10 +131,20 @@ class DualRegionGate(nn.Module):
             self.conf_mid,
             self.k_conf,
             self.smooth_k,
+            depth_normalization=self.depth_normalization,
         )
         region_b = valid_mask & (~region_a)
-        logits_a = self.gate_a(fused_features).squeeze(1)
-        logits_b = self.gate_b(fused_features).squeeze(1)
+        if self.proposal_conditioned:
+            if proposal_cues is None or proposal_cues.shape != (depth.size(0), 2, *depth.shape[-2:]):
+                raise ValueError("proposal gate requires (B,2,H,W) cues")
+            proposal_cues = proposal_cues.detach()
+            logits_a = self.gate_a[2](self.gate_a[1](
+                self.gate_a[0](fused_features) + self.proposal_a(proposal_cues))).squeeze(1)
+            logits_b = self.gate_b[2](self.gate_b[1](
+                self.gate_b[0](fused_features) + self.proposal_b(proposal_cues))).squeeze(1)
+        else:
+            logits_a = self.gate_a(fused_features).squeeze(1)
+            logits_b = self.gate_b(fused_features).squeeze(1)
         learned_a = torch.sigmoid(logits_a)
         learned_b = torch.sigmoid(logits_b)
         gate = region_a.float() * learned_a + weight_b * learned_b
@@ -165,17 +191,20 @@ class SGERBlock(nn.Module):
     def __init__(self, feature_channels, projected_feature_channels=8,
                  hidden_channels=32, gate_channels=16,
                  max_residual_ratio=2.0, residual_final_activation="relu",
-                 residual_negative_slope=0.01, **gate_kwargs):
+                 residual_negative_slope=0.01, depth_normalization="batch",
+                 proposal_conditioned=False, **gate_kwargs):
         super(SGERBlock, self).__init__()
         self.max_residual_ratio = float(max_residual_ratio)
-        self.cues = GeometryCueExtractor()
+        self.cues = GeometryCueExtractor(depth_normalization)
         self.feature_projection = nn.Conv2d(
             feature_channels, projected_feature_channels, 1, bias=False)
         self.uncertainty_channels = 3
         fused_channels = (
             15 + projected_feature_channels + self.uncertainty_channels)
         self.gate = DualRegionGate(
-            fused_channels, hidden_channels=gate_channels, **gate_kwargs)
+            fused_channels, hidden_channels=gate_channels,
+            depth_normalization=depth_normalization,
+            proposal_conditioned=proposal_conditioned, **gate_kwargs)
         self.residual = ResidualDepthHead(
             fused_channels, hidden_channels=hidden_channels,
             final_activation=residual_final_activation,
@@ -219,14 +248,16 @@ class SGERBlock(nn.Module):
         fused = torch.cat([
             cues["cue_tensor"], feature, uncertainty], dim=1)
 
-        (benefit_gate, region_a, region_b, weight_b,
-         logits_a, logits_b, gate_valid) = self.gate(
-            fused, ref_img, depth, confidence, cues["valid_mask"],
-            return_logits=True)
         residual_logit = self.residual(fused)
         interval = float(depth_interval)
         max_residual = self.max_residual_ratio * interval
         raw_residual = max_residual * torch.tanh(residual_logit)
+        proposal = torch.tanh(residual_logit).detach()
+        proposal_cues = torch.stack((proposal, proposal.abs()), dim=1)
+        (benefit_gate, region_a, region_b, weight_b,
+         logits_a, logits_b, gate_valid) = self.gate(
+            fused, ref_img, depth, confidence, cues["valid_mask"],
+            return_logits=True, proposal_cues=proposal_cues)
         gated_residual = benefit_gate * raw_residual
         depth_refined = depth + gated_residual
         residual_ratio = gated_residual.abs() / (interval + 1e-6)

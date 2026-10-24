@@ -13,6 +13,8 @@ from datasets.data_io import read_pfm, save_pfm
 from plyfile import PlyData, PlyElement
 from PIL import Image
 from gipuma import gipuma_filter
+from evaluation_record import start_inference, write_json, sha256
+from pathlib import Path
 
 from multiprocessing import Pool
 from functools import partial
@@ -33,6 +35,7 @@ parser.add_argument('--numdepth', type=int, default=192, help='the number of dep
 
 parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
 parser.add_argument('--outdir', default='./outputs', help='output dir')
+parser.add_argument('--save_only', action='store_true', help='export paired maps without fusion')
 parser.add_argument('--display', action='store_true', help='display depth images and masks')
 
 parser.add_argument('--share_cr', action='store_true', help='whether share the cost volume regularization')
@@ -50,6 +53,8 @@ parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gat
 parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
 parser.add_argument("--sger_residual_final_activation", choices=("relu", "leaky_relu"), default="relu")
 parser.add_argument("--sger_residual_negative_slope", type=float, default=0.01)
+parser.add_argument("--sger_depth_normalization", choices=("batch", "sample"), default="batch")
+parser.add_argument("--sger_proposal_gate", action="store_true", help="condition SGER gate on the signed residual proposal")
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--allow_legacy_checkpoint', action='store_true', help='allow loading a checkpoint without SGER parameters')
@@ -248,6 +253,8 @@ def save_scene_depth(testlist):
                           sger_max_residual_ratio=args.sger_max_residual_ratio,
                           sger_residual_final_activation=args.sger_residual_final_activation,
                           sger_residual_negative_slope=args.sger_residual_negative_slope,
+                          sger_depth_normalization=args.sger_depth_normalization,
+                          sger_proposal_gate=args.sger_proposal_gate,
                           detach_refined_feedback=args.detach_refined_feedback,
                           sger_gate_kwargs={
                               "threshold_edge": args.region_edge_threshold,
@@ -261,6 +268,12 @@ def save_scene_depth(testlist):
     # load checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
     state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
+    if state_dict.get('sger_depth_normalization', 'batch') != args.sger_depth_normalization:
+        raise ValueError('Inference requires the checkpoint SGER depth normalization mode')
+    if state_dict.get('sger_proposal_gate', False) != args.sger_proposal_gate:
+        raise ValueError('Inference requires matching --sger_proposal_gate checkpoint configuration')
+    inference_record['checkpoint_epoch'] = state_dict.get('epoch')
+    write_json(Path(args.outdir) / 'inference_manifest.json', inference_record)
     allow_sger_initialization = args.allow_legacy_checkpoint or args.use_sger or args.use_sger_lite
     load_result = model.load_state_dict(
         state_dict['model'], strict=not allow_sger_initialization)
@@ -269,9 +282,14 @@ def save_scene_depth(testlist):
             load_result.missing_keys, load_result.unexpected_keys,
             args.use_sger, args.use_sger_lite)
         if load_result.missing_keys:
+            if not args.allow_legacy_checkpoint:
+                raise RuntimeError('Missing SGER checkpoint weights; use --allow_legacy_checkpoint only for explicit initialization')
             print("missing keys when loading checkpoint:", load_result.missing_keys)
         if load_result.unexpected_keys:
             print("unexpected keys when loading checkpoint:", load_result.unexpected_keys)
+    inference_record['checkpoint_missing_keys'] = list(load_result.missing_keys)
+    inference_record['checkpoint_unexpected_keys'] = list(load_result.unexpected_keys)
+    write_json(Path(args.outdir) / 'inference_manifest.json', inference_record)
     model = nn.DataParallel(model)
     model.cuda()
     model.eval()
@@ -576,8 +594,16 @@ if __name__ == '__main__':
         testlist = [e for e in os.listdir(args.testpath) if os.path.isdir(os.path.join(args.testpath, e))] \
             if not args.testpath_single_scene else [os.path.basename(args.testpath_single_scene)]
 
-    # step1. save all the depth maps and the masks in outputs directory
+    inference_record = start_inference(args, testlist)
+    # step1. save paired depths from the same forward pass.
     save_depth(testlist)
+    inference_record['files_sha256'] = {str(path.relative_to(Path(args.outdir))): sha256(path)
+        for scan in testlist for folder in ('depth_est', 'depth_est_raw', 'confidence', 'cams', 'images')
+        for path in sorted((Path(args.outdir)/scan/folder).iterdir()) if path.is_file()}
+    inference_record['status'] = 'complete'
+    write_json(Path(args.outdir) / 'inference_manifest.json', inference_record)
+    if args.save_only:
+        sys.exit(0)
 
     # step2. filter saved depth maps with photometric confidence maps and geometric constraints
     if args.filter_method != "gipuma":

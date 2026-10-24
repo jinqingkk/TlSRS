@@ -589,13 +589,25 @@ def sobel_gradient_magnitude(ref_img, target_size):
     return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-12).squeeze(1)
 
 
-def depth_gradient_magnitude(depth, valid_mask):
+def masked_depth_mean(depth, valid_mask, normalization="batch"):
+    """Detached scale for geometry cues; sample mode never mixes scenes."""
+    if normalization == "batch":
+        return masked_mean(depth, valid_mask).detach()
+    if normalization != "sample":
+        raise ValueError("depth normalization must be batch or sample")
+    valid = (valid_mask > 0.5) & torch.isfinite(depth)
+    safe_depth = torch.where(valid, depth, torch.zeros_like(depth))
+    count = valid.to(depth.dtype).sum(dim=(-2, -1), keepdim=True)
+    return (safe_depth.sum(dim=(-2, -1), keepdim=True) / (count + 1e-6)).detach()
+
+
+def depth_gradient_magnitude(depth, valid_mask, depth_normalization="batch"):
     if depth.dim() == 4:
         depth = depth.squeeze(1)
     if valid_mask.dim() == 4:
         valid_mask = valid_mask.squeeze(1)
     valid_mask = valid_mask > 0.5
-    depth_mean = masked_mean(depth, valid_mask).detach()
+    depth_mean = masked_depth_mean(depth, valid_mask, depth_normalization)
     depth_norm = depth / (depth_mean + 1e-6)
     grad = depth.new_zeros(depth.shape)
     depth_dx = gradient_x(depth_norm).abs()
@@ -609,13 +621,13 @@ def depth_gradient_magnitude(depth, valid_mask):
     return grad
 
 
-def curvature_magnitude(depth, valid_mask):
+def curvature_magnitude(depth, valid_mask, depth_normalization="batch"):
     if depth.dim() == 4:
         depth = depth.squeeze(1)
     if valid_mask.dim() == 4:
         valid_mask = valid_mask.squeeze(1)
     valid_mask = valid_mask > 0.5
-    depth_mean = masked_mean(depth, valid_mask).detach()
+    depth_mean = masked_depth_mean(depth, valid_mask, depth_normalization)
     depth_norm = depth / (depth_mean + 1e-6)
     curv = depth.new_zeros(depth.shape)
     if depth.size(2) >= 3:
@@ -681,7 +693,7 @@ def build_geometry_weight(ref_img, valid_mask, confidence, target_size,
 def build_dual_region_geometry(ref_img, valid_mask, depth, confidence, target_size,
                                threshold_edge=0.25, threshold_depth=0.02,
                                threshold_curv=0.02, conf_mid=0.65,
-                               k_conf=10.0, smooth_k=2.0):
+                               k_conf=10.0, smooth_k=2.0, depth_normalization="batch"):
     if valid_mask.dim() == 4:
         valid_mask = valid_mask.squeeze(1)
     if valid_mask.shape[-2:] != target_size:
@@ -704,8 +716,8 @@ def build_dual_region_geometry(ref_img, valid_mask, depth, confidence, target_si
                                    mode='bilinear', align_corners=False).squeeze(1)
 
     edge_map = sobel_gradient_magnitude(ref_img, target_size)
-    depth_grad = depth_gradient_magnitude(depth_for_mask, valid_mask)
-    curv_map = curvature_magnitude(depth_for_mask, valid_mask)
+    depth_grad = depth_gradient_magnitude(depth_for_mask, valid_mask, depth_normalization)
+    curv_map = curvature_magnitude(depth_for_mask, valid_mask, depth_normalization)
 
     edge_mask = edge_map > threshold_edge
     depth_edge_mask = depth_grad > threshold_depth
@@ -942,7 +954,40 @@ def stable_gate_binary_cross_entropy(logits_a, logits_b, region_a, weight_b,
     return (losses * weights).sum() / (weights.sum() + 1e-6)
 
 
+def feasible_gate_step_loss(stage, depth_gt, mask):
+    """Supervise the attainable gate step, conditional on a fixed proposal.
+
+    depth_refined = raw + beta * capacity * sigmoid(z) * proposal.
+    The detached target minimizes per-pixel absolute depth error on this
+    segment. Weight by attainable displacement; zero-step pixels contribute
+    zero, and class rebalancing must not distort fractional step targets.
+    No gradient is allowed into the target, proposal, or geometry capacity.
+    """
+    raw = stage['depth_raw'].detach()
+    proposal = stage['raw_depth_residual'].detach()
+    capacity = (stage['region_a'].to(raw.dtype) +
+                stage['region_b_weight']).detach()
+    capacity = capacity * stage['gate_valid_mask'].to(raw.dtype).detach()
+    beta = torch.as_tensor(stage.get('sger_residual_scale', 1.0),
+                           dtype=raw.dtype, device=raw.device).detach()
+    step = beta * capacity * proposal
+    selected = (mask > .5) & torch.isfinite(depth_gt) & torch.isfinite(step) & (step.abs() > 1e-6)
+    logits = torch.where(stage['region_a'].bool(), stage['gate_logits_a'], stage['gate_logits_b'])
+    if not bool(selected.any()):
+        return logits[selected].sum(), raw.new_zeros(()), raw.new_zeros(())
+    if not bool(torch.isfinite(logits[selected]).all()):
+        raise ValueError('Nonfinite feasible-step gate logits')
+    target = ((depth_gt.detach()[selected] - raw[selected]) / step[selected]).clamp(0, 1)
+    weights = step[selected].abs()
+    losses = F.binary_cross_entropy_with_logits(logits[selected], target, reduction='none')
+    loss = (losses * weights).sum() / weights.sum().clamp_min(1e-6)
+    return loss, target.mean(), selected.float().mean()
+
+
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
+    gate_supervision = kwargs.get('gate_supervision', 'binary')
+    if gate_supervision not in ('binary', 'feasible_step'):
+        raise ValueError('Unknown gate supervision: ' + gate_supervision)
     gate_bce_mode = kwargs.get("gate_bce_mode", "legacy_clamp")
     if gate_bce_mode not in ("legacy_clamp", "stable_logprob"):
         raise ValueError("unknown gate_bce_mode: {}".format(gate_bce_mode))
@@ -1111,7 +1156,12 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
                 benefit_margin_ratio)
             residual_target_loss = F.smooth_l1_loss(
                 raw_residual[mask], residual_target[mask], reduction="mean")
-            if gate_bce_mode == "stable_logprob":
+            if gate_supervision == 'feasible_step':
+                gate_benefit_loss, step_target_mean, step_mask_ratio = feasible_gate_step_loss(
+                    stage_inputs, depth_gt, mask)
+                extra['{}/gate_step_target_mean'.format(stage_key)] = step_target_mean.detach()
+                extra['{}/gate_step_mask_ratio'.format(stage_key)] = step_mask_ratio.detach()
+            elif gate_bce_mode == "stable_logprob":
                 gate_benefit_loss = stable_gate_binary_cross_entropy(
                     stage_inputs["gate_logits_a"], stage_inputs["gate_logits_b"],
                     stage_inputs["region_a"], stage_inputs["region_b_weight"],

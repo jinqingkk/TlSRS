@@ -107,7 +107,8 @@ class CascadeMVSNet(nn.Module):
                  sger_share=False, sger_feature_channels=8, sger_hidden_channels=32,
                  sger_gate_channels=16, sger_max_residual_ratio=0.5,
                  detach_refined_feedback=True, sger_gate_kwargs=None,
-                 sger_residual_final_activation="relu", sger_residual_negative_slope=0.01):
+                 sger_residual_final_activation="relu", sger_residual_negative_slope=0.01,
+                 sger_depth_normalization="batch", sger_proposal_gate=False):
         super(CascadeMVSNet, self).__init__()
         if use_sger and use_sger_lite:
             raise ValueError("use_sger and use_sger_lite are mutually exclusive")
@@ -170,6 +171,8 @@ class CascadeMVSNet(nn.Module):
                     max_residual_ratio=sger_max_residual_ratio,
                     residual_final_activation=sger_residual_final_activation,
                     residual_negative_slope=sger_residual_negative_slope,
+                    depth_normalization=sger_depth_normalization,
+                    proposal_conditioned=sger_proposal_gate,
                     **self.sger_gate_kwargs)
             else:
                 self.sger_blocks = nn.ModuleList([
@@ -181,6 +184,8 @@ class CascadeMVSNet(nn.Module):
                         max_residual_ratio=sger_max_residual_ratio,
                         residual_final_activation=sger_residual_final_activation,
                         residual_negative_slope=sger_residual_negative_slope,
+                        depth_normalization=sger_depth_normalization,
+                        proposal_conditioned=sger_proposal_gate,
                         **self.sger_gate_kwargs)
                     for out_channels in (
                         [self.feature.out_channels[self.num_stage - 1]]

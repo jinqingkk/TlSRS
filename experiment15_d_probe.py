@@ -28,6 +28,8 @@ def build_model(args):
         sger_feature_channels=args.sger_feature_channels,sger_hidden_channels=args.sger_hidden_channels,
         sger_gate_channels=args.sger_gate_channels,sger_max_residual_ratio=args.sger_max_residual_ratio,
         sger_residual_final_activation='relu',sger_residual_negative_slope=args.sger_residual_negative_slope,
+        sger_depth_normalization=getattr(args, "sger_depth_normalization", "batch"),
+        sger_proposal_gate=getattr(args, "sger_proposal_gate", False),
         detach_refined_feedback=True,sger_gate_kwargs={
             'threshold_edge':args.region_edge_threshold,'threshold_depth':args.region_depth_threshold,
             'threshold_curv':args.region_curv_threshold,'conf_mid':args.geometry_conf_mid,

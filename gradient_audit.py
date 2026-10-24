@@ -66,6 +66,7 @@ def build_parser():
     parser.add_argument("--sger_max_residual_ratio", type=float, default=0.25)
     parser.add_argument("--sger_residual_final_activation", choices=("relu", "leaky_relu"), default="relu")
     parser.add_argument("--sger_residual_negative_slope", type=float, default=0.01)
+    parser.add_argument("--sger_depth_normalization", choices=("batch", "sample"), default="batch")
     parser.add_argument("--sger_warmup_start_epoch", type=int, default=7)
     parser.add_argument("--sger_warmup_end_epoch", type=int, default=10)
     parser.add_argument("--freeze_backbone_epochs", type=int, default=0)
@@ -309,6 +310,7 @@ def main(argv=None):
         sger_max_residual_ratio=args.sger_max_residual_ratio,
         sger_residual_final_activation=args.sger_residual_final_activation,
         sger_residual_negative_slope=args.sger_residual_negative_slope,
+        sger_depth_normalization=args.sger_depth_normalization,
         detach_refined_feedback=True,
         sger_gate_kwargs={
             "threshold_edge": args.region_edge_threshold,

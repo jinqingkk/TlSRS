@@ -80,6 +80,9 @@ parser.add_argument('--sger_gate_channels', type=int, default=16, help='SGER gat
 parser.add_argument('--sger_max_residual_ratio', type=float, default=0.25, help='maximum residual in stage depth intervals')
 parser.add_argument("--sger_residual_final_activation", choices=("relu", "leaky_relu"), default="relu")
 parser.add_argument("--sger_residual_negative_slope", type=float, default=0.01)
+parser.add_argument("--sger_depth_normalization", choices=("batch", "sample"), default="batch")
+parser.add_argument("--gate_supervision", choices=("binary", "feasible_step"), default="binary")
+parser.add_argument("--sger_proposal_gate", action="store_true", help="condition SGER gate on the signed residual proposal")
 parser.add_argument('--detach_refined_feedback', action='store_true', default=True, help='detach refined depth before next-stage sampling')
 parser.add_argument('--allow_refined_feedback_grad', dest='detach_refined_feedback', action='store_false', help='allow gradients through refined-depth cascade feedback')
 parser.add_argument('--raw_depth_loss_weight', type=float, default=1.0, help='auxiliary raw stage depth loss weight')
@@ -123,6 +126,7 @@ def loss_kwargs(sample_cuda, args):
         "residual_target_loss_weight": args.residual_target_loss_weight,
         "gate_benefit_loss_weight": args.gate_benefit_loss_weight,
         "gate_bce_mode": getattr(args, "gate_bce_mode", "legacy_clamp"),
+        "gate_supervision": getattr(args, "gate_supervision", "binary"),
         "residual_target_ratio": args.residual_target_ratio,
         "benefit_margin_ratio": args.benefit_margin_ratio,
         "residual_target_loss_scale": getattr(
@@ -342,8 +346,11 @@ def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epo
                     'model': model.module.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'gate_bce_mode': args.gate_bce_mode,
+                    'gate_supervision': args.gate_supervision,
+                    'sger_proposal_gate': args.sger_proposal_gate,
                     'sger_residual_final_activation': args.sger_residual_final_activation,
                     'sger_residual_negative_slope': args.sger_residual_negative_slope,
+                    'sger_depth_normalization': args.sger_depth_normalization,
                     'sger_warmup_start_epoch': args.sger_warmup_start_epoch,
                     'sger_warmup_end_epoch': args.sger_warmup_end_epoch},
                     "{}/model_{:0>6}.ckpt".format(args.logdir, epoch_idx))
@@ -610,6 +617,8 @@ if __name__ == '__main__':
                           sger_max_residual_ratio=args.sger_max_residual_ratio,
                           sger_residual_final_activation=args.sger_residual_final_activation,
                           sger_residual_negative_slope=args.sger_residual_negative_slope,
+                          sger_depth_normalization=args.sger_depth_normalization,
+                          sger_proposal_gate=args.sger_proposal_gate,
                           detach_refined_feedback=args.detach_refined_feedback,
                           sger_gate_kwargs={
                               "threshold_edge": args.region_edge_threshold,
@@ -644,6 +653,10 @@ if __name__ == '__main__':
         state_dict = torch.load(loadckpt, map_location=torch.device("cpu"))
         print("checkpoint gate BCE:", state_dict.get("gate_bce_mode", "legacy_clamp"),
               "requested gate BCE:", args.gate_bce_mode)
+        if state_dict.get('sger_depth_normalization', 'batch') != args.sger_depth_normalization:
+            raise ValueError('Resume requires the checkpoint SGER depth normalization mode')
+        if state_dict.get('sger_proposal_gate', False) != args.sger_proposal_gate or state_dict.get('gate_supervision', 'binary') != args.gate_supervision:
+            raise ValueError('Resume requires matching SGER gate architecture and supervision')
         validate_sger_warmup_checkpoint(state_dict, args)
         model.load_state_dict(state_dict['model'])
         optimizer.load_state_dict(state_dict['optimizer'])

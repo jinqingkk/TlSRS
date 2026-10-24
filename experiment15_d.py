@@ -89,6 +89,8 @@ def main():
     manifest=json.loads(manifest_path.read_text()) if manifest_path.exists() else {'runs':[]}
     def run(epoch,activation,batches):
         values=dict(next(r['arguments'] for r in protocol['rows'] if r['epoch']==epoch))
+        # Historical manifests predate the explicit normalization option.
+        values.setdefault('sger_depth_normalization', 'batch')
         values.update(activation_ab=False,gate_bce_ab=True,gate_bce_mode='legacy_clamp',
                       sger_residual_final_activation=activation,batch_indices=','.join(map(str,batches)),
                       output_json=str(ROOT/('audit_'+activation)/('gate_bce_epoch%d.json'%epoch)))

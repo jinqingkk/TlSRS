@@ -7,6 +7,10 @@ from datetime import datetime
 import os.path as osp
 import shutil
 import glob
+import subprocess
+import shlex
+from evaluation_record import sha256, write_json
+from pathlib import Path
 
 # read intrinsics and extrinsics
 def read_camera_parameters(filename):
@@ -178,36 +182,46 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
     depth_max = 100000
     normal_thresh = 360
 
-    cmd = fusibile_exe_path
-    cmd = cmd + ' -input_folder ' + point_folder + '/'
-    cmd = cmd + ' -p_folder ' + cam_folder + '/'
-    cmd = cmd + ' -images_folder ' + image_folder + '/'
-    cmd = cmd + ' --depth_min=' + str(depth_min)
-    cmd = cmd + ' --depth_max=' + str(depth_max)
-    cmd = cmd + ' --normal_thresh=' + str(normal_thresh)
-    cmd = cmd + ' --disp_thresh=' + str(disp_thresh)
-    cmd = cmd + ' --num_consistent=' + str(num_consistent)
-    print(cmd)
-    os.system(cmd)
-
-    return
+    # Never select an earlier run's PLY, including after a successful no-op.
+    previous = set(glob.glob(osp.join(point_folder, "consistencyCheck-*")))
+    cmd = [fusibile_exe_path.strip(), '-input_folder', point_folder + '/',
+           '-p_folder', cam_folder + '/', '-images_folder', image_folder + '/',
+           '--depth_min=' + str(depth_min), '--depth_max=' + str(depth_max),
+           '--normal_thresh=' + str(normal_thresh), '--disp_thresh=' + str(disp_thresh),
+           '--num_consistent=' + str(num_consistent)]
+    print(' '.join(shlex.quote(value) for value in cmd))
+    with open(osp.join(point_folder, 'fusibile.log'), 'w') as log:
+        subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
+    created = set(glob.glob(osp.join(point_folder, "consistencyCheck-*"))) - previous
+    candidates = [osp.join(folder, 'final3d_model.ply') for folder in created
+                  if osp.isfile(osp.join(folder, 'final3d_model.ply'))]
+    if len(candidates) != 1 or osp.getsize(candidates[0]) == 0:
+        raise RuntimeError('Fusion must produce exactly one new nonempty PLY; see ' + point_folder)
+    return candidates[0]
 
 
 def gipuma_filter(testlist, outdir, prob_threshold, disp_threshold, num_consistent, fusibile_exe_path,
                   depth_folder="depth_est", confidence_folder="confidence"):
 
     # 获取当前时间作为当前处理批号，用作文件夹名，放点云文件
-    batch_num = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch_num = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     # 创建批处理文件夹
     batch_folder = osp.join(outdir, batch_num)
-    os.makedirs(batch_folder, exist_ok=True)
+    os.makedirs(batch_folder, exist_ok=False)
+    record = {'status': 'running', 'scans': list(testlist),
+              'depth_folder': depth_folder, 'confidence_folder': confidence_folder,
+              'prob_threshold': prob_threshold, 'disp_threshold': disp_threshold,
+              'num_consistent': num_consistent,
+              'fusibile_exe': osp.abspath(fusibile_exe_path.strip()),
+              'fusibile_sha256': sha256(fusibile_exe_path.strip()), 'outputs': {}}
+    write_json(Path(batch_folder) / 'fusion_manifest.json', record)
 
     for scan in testlist:
 
         out_folder = os.path.join(outdir, scan)
         dense_folder = out_folder
 
-        point_folder = os.path.join(dense_folder, 'points_mvsnet')
+        point_folder = os.path.join(batch_folder, scan + '_points_mvsnet')
         if not os.path.isdir(point_folder):
             os.mkdir(point_folder)
 
@@ -221,18 +235,7 @@ def gipuma_filter(testlist, outdir, prob_threshold, disp_threshold, num_consiste
 
         # depth map fusion with gipuma
         print('Run depth map fusion & filter')
-        depth_map_fusion(point_folder, fusibile_exe_path, disp_threshold, num_consistent)
-
-        # copy .ply  to plys
-        # cur_dirs = os.listdir(point_folder)
-        # filter_dirs = list(filter(lambda x: x.startswith("consistencyCheck"), cur_dirs))
-        # filter_dirs_len = len(filter_dirs)
-        # rename_cmd = "cp " + osp.join(point_folder,
-        #                               filter_dirs[-1]) + "/final3d_model.ply {}/{}/casmvsnet_{}_l{}.ply".format(
-        #     outdir, batch_num, scan, scene
-        # )
-        # print(rename_cmd)
-        # os.system(rename_cmd)
+        latest_ply = depth_map_fusion(point_folder, fusibile_exe_path, disp_threshold, num_consistent)
 
         # 提取 scan ID 并补零到3位
         if scan.startswith('scan'):
@@ -241,16 +244,11 @@ def gipuma_filter(testlist, outdir, prob_threshold, disp_threshold, num_consiste
         else:
             scan_id_padded = scan.zfill(3)  # 直接补零
 
-        # 查找并复制文件
-        ply_files = glob.glob(osp.join(point_folder, "consistencyCheck-*", "final3d_model.ply"))
-
-        if ply_files:
-            latest_ply = max(ply_files, key=os.path.getmtime)
-
-            # 生成目标文件名（scene 假设为3）
-            scene_level = 3  # 或者从其他地方获取
-            target_ply_name = f"casmvsnet{scan_id_padded}_l{scene_level}.ply"
-            target_ply = osp.join(batch_folder, target_ply_name)
-
-            shutil.copy2(latest_ply, target_ply)
-            print(f" {scan}: {latest_ply} -> {target_ply}")
+        target_ply = osp.join(batch_folder, "casmvsnet{}_l3.ply".format(scan_id_padded))
+        shutil.copy2(latest_ply, target_ply)
+        record['outputs'][scan] = {'path': target_ply, 'sha256': sha256(target_ply)}
+        write_json(Path(batch_folder) / 'fusion_manifest.json', record)
+        print("{}: {} -> {}".format(scan, latest_ply, target_ply))
+    record['status'] = 'complete'
+    write_json(Path(batch_folder) / 'fusion_manifest.json', record)
+    return batch_folder
