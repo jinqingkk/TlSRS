@@ -2,6 +2,16 @@ conda activate mvsnetpy37
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jinqing002/miniconda3/envs/mvsnetpy37/lib/python3.7/site-packages/torch/lib:$LD_LIBRARY_PATH
 
 # 镜像模式
+export http_proxy=http://127.0.0.1:7892
+export https_proxy=http://127.0.0.1:7892
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+
+
+conda activate mvsnetpy37
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jinqing002/miniconda3/envs/mvsnetpy37/lib/python3.7/site-packages/torch/lib:$LD_LIBRARY_PATH
+
+# 镜像模式
 export http_proxy=http://127.0.0.1:8889
 export https_proxy=http://127.0.0.1:8889
 export HTTP_PROXY=$http_proxy
