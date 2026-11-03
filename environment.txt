@@ -1,0 +1,41 @@
+conda activate mvsnetpy37
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jinqing002/miniconda3/envs/mvsnetpy37/lib/python3.7/site-packages/torch/lib:$LD_LIBRARY_PATH
+
+# 镜像模式
+export http_proxy=http://127.0.0.1:7892
+export https_proxy=http://127.0.0.1:7892
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+
+
+conda activate mvsnetpy37
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jinqing002/miniconda3/envs/mvsnetpy37/lib/python3.7/site-packages/torch/lib:$LD_LIBRARY_PATH
+
+# 镜像模式
+export http_proxy=http://127.0.0.1:8889
+export https_proxy=http://127.0.0.1:8889
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+
+net模式
+HOST_IP=$(ip route | awk '/default/ {print $3}')
+export http_proxy="http://${HOST_IP}:8889"
+export https_proxy="http://${HOST_IP}:8889"
+export all_proxy="socks5h://${HOST_IP}:1089"
+
+
+echo $HOST_IP
+echo $http_proxy
+echo $https_proxy
+echo $all_proxy
+
+python gradient_audit.py --trainpath ./data/DTU/mvs_training/dtu/ --trainlist lists/dtu/train.txt --loadckpt ./checkpoints/experiment15_b_backbone_lr1/model_000012.ckpt --audit_epoch 8 --output_json ./outputs/experiment15c/gradient_audit_epoch8.json --ndepths "48,32,8" --depth_inter_r "4,2,1" --dlossw "0.5,1.0,2.0" --numdepth 192 --interval_scale 1.06 --sger_max_residual_ratio 0.25 --raw_depth_loss_weight 1.0 --refined_depth_loss_weight 1.0 --residual_loss_weight 0.01 --safe_refine_loss_weight 0.1 --residual_target_loss_weight 0.05 --gate_benefit_loss_weight 0.05
+
+
+清除代理环境变量
+unset http_proxy
+unset https_proxy
+unset all_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+unset ALL_PROXY

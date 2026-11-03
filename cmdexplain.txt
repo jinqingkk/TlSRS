@@ -14,3 +14,10 @@ python test.py \
   --interval_scale=1.06 \
   --filter_method=gipuma
 
+  test3-4
+python test.py   --dataset=general_eval   --batch_size=1   --testpath=data/DTU/dtu_test_all   --testlist=lists/dtu/test.txt   --loadckpt=./checkpoints/test3-4/model_000015.ckpt   --outdir=./outputs/exp12_epoch15_b   --interval_scale=1.06   --filter_method=gipuma   --use_sger_lite --fusion_depth_source refined --fusion_confidence_source residual_calibrated --confidence_residual_alpha 0.25 --confidence_residual_floor 0.5
+
+python test.py   --dataset=general_eval   --batch_size=1   --testpath=data/DTU/dtu_test_all   --testlist=lists/dtu/test.txt   --loadckpt=./checkpoints/test3-4/model_000015.ckpt   --outdir=./outputs/exp12_epoch15_c   --interval_scale=1.06   --filter_method=gipuma   --use_sger_lite --fusion_depth_source raw --fusion_confidence_source raw --confidence_residual_alpha 0.25 --confidence_residual_floor 0.5
+
+
+
